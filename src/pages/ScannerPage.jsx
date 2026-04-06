@@ -4,64 +4,44 @@ import jsQR from 'jsqr'
 import { motion, AnimatePresence } from 'framer-motion'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../contexts/AuthContext'
-import { ChevronLeft, Zap, RotateCcw, X } from 'lucide-react'
+import { ChevronLeft, Zap, X } from 'lucide-react'
+import { QRCodeSVG } from 'qrcode.react'
 
-// LocalStorage key for camera permission preference
 const PREF_KEY = 'fruitbearers_camera_pref'
-
-// ─── STATES ───────────────────────────────────────────────
-// 'idle'        → show permission dialog
-// 'requesting'  → getUserMedia in progress
-// 'scanning'    → camera live, scanning loop running
-// 'denied'      → user chose Don't Allow or browser denied
-// 'success'     → QR scanned & check-in recorded
-// 'error'       → unexpected error
-// ──────────────────────────────────────────────────────────
 
 export default function ScannerPage() {
   const navigate = useNavigate()
   const { profile } = useAuth()
 
-  const [phase, setPhase]           = useState('idle')   // see states above
+  const [phase, setPhase]           = useState('idle')
   const [scannedCode, setScannedCode] = useState(null)
   const [checkInResult, setCheckInResult] = useState(null)
   const [torchOn, setTorchOn]       = useState(false)
-  const [savedPref, setSavedPref]   = useState(null)     // 'always'|'once'|'deny'|null
+  const [pin, setPin]               = useState('')
+  const [loading, setLoading]       = useState(false)
 
   const videoRef  = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
   const rafRef    = useRef(null)
 
-  // Read stored preference on mount
   useEffect(() => {
     const pref = localStorage.getItem(PREF_KEY)
-    setSavedPref(pref)
-    // Auto-open camera if they previously chose "always"
-    if (pref === 'always') {
-      setPhase('requesting')
-    }
+    if (pref === 'always') setPhase('requesting')
   }, [])
 
-  // Start camera when phase becomes 'requesting'
   useEffect(() => {
     if (phase === 'requesting') startCamera()
   }, [phase])
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => stopCamera()
   }, [])
 
-  // ── Start camera stream ──────────────────────────────────
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: 'environment' }, // rear camera preferred
-          width:  { ideal: 1280 },
-          height: { ideal: 720  },
-        },
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       })
       streamRef.current = stream
@@ -72,467 +52,165 @@ export default function ScannerPage() {
         requestAnimationFrame(scanLoop)
       }
     } catch (err) {
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setPhase('denied')
-      } else {
-        console.error('Camera error:', err)
-        setPhase('error')
-      }
+      setPhase(err.name === 'NotAllowedError' ? 'denied' : 'error')
     }
   }
 
-  // ── QR scan loop (runs every frame) ─────────────────────
   const scanLoop = useCallback(() => {
     if (!videoRef.current || !canvasRef.current) return
-    const video  = videoRef.current
+    const video = videoRef.current
     const canvas = canvasRef.current
-    const ctx    = canvas.getContext('2d', { willReadFrequently: true })
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
 
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      canvas.width  = video.videoWidth
+      canvas.width = video.videoWidth
       canvas.height = video.videoHeight
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-      const code = jsQR(imageData.data, imageData.width, imageData.height, {
-        inversionAttempts: 'dontInvert',
-      })
-      if (code?.data) {
-        handleQRCode(code.data)
-        return // stop loop
-      }
+      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'dontInvert' })
+      if (code?.data) { handleQRCode(code.data); return }
     }
     rafRef.current = requestAnimationFrame(scanLoop)
   }, [])
 
-  // ── Handle a detected QR code ────────────────────────────
   const handleQRCode = async (data) => {
     stopCamera()
     setScannedCode(data)
+    verifyAndCheckIn(data, 'qr')
+  }
 
-    // 1. Validate session
-    const { data: session, error: sErr } = await supabase
-      .from('attendance_sessions')
-      .select('*')
-      .eq('qr_code_value', data)
-      .single()
+  const handlePIN = (digit) => {
+    if (pin.length < 4) setPin(p => p + digit)
+  }
+
+  const verifyAndCheckIn = async (codeValue, method) => {
+    if (loading) return
+    setLoading(true)
+
+    const today = new Date().toISOString().split('T')[0]
+    const query = supabase.from('attendance_sessions').select('*')
+    
+    if (method === 'qr') query.eq('qr_code_value', codeValue)
+    else query.eq('pin', codeValue).eq('service_date', today)
+
+    const { data: session, error: sErr } = await query.single()
 
     if (sErr || !session) {
       setPhase('success')
-      setCheckInResult({ success: false, message: 'Invalid QR Code' })
+      setCheckInResult({ success: false, message: method === 'qr' ? 'Invalid QR Code' : `PIN "${codeValue}" not found for Today` })
+      setLoading(false)
       return
     }
 
-    // 2. Check expiry
     if (new Date(session.expires_at) < new Date()) {
       setPhase('success')
       setCheckInResult({ success: false, message: 'This session has expired' })
+      setLoading(false)
       return
     }
 
-    setPhase('success')
-
-    // 3. Record attendance
     if (profile?.id) {
-      const today = new Date().toISOString().split('T')[0]
-      const { error } = await supabase
-        .from('attendance')
-        .insert({ 
-          user_id: profile.id, 
-          session_id: session.id,
-          service_date: session.service_date,
-          service_type: session.service_type,
-          method: 'qr' 
-        })
-
+      const { error } = await supabase.from('attendance_records').insert({ user_id: profile.id, session_id: session.id })
       if (!error) {
-        // Increment streak
-        const newStreak = (profile.attendance_streak || 0) + 1
-        await supabase.from('profiles')
-          .update({ attendance_streak: newStreak, last_checkin: today })
-          .eq('id', profile.id)
-        setCheckInResult({ success: true, streak: newStreak, session })
-      } else {
-        if (error.code === '23505') {
-          setCheckInResult({ success: false, message: 'Already checked in for this session' })
-        } else {
-          setCheckInResult({ success: false, message: error.message })
+        let newStreak = profile.attendance_streak || 0
+        if (!profile.last_checkin) newStreak = 1
+        else if (profile.last_checkin !== today) {
+          const diff = Math.floor((new Date() - new Date(profile.last_checkin)) / (1000*60*60*24))
+          newStreak = diff <= 8 ? newStreak + 1 : 1
         }
+        await supabase.from('profiles').update({ attendance_streak: newStreak, last_checkin: today }).eq('id', profile.id)
+        setCheckInResult({ success: true, streak: newStreak })
+      } else {
+        setCheckInResult({ success: false, message: error.code === '23505' ? 'Already checked in' : error.message })
       }
     }
+    setPhase('success')
+    setLoading(false)
   }
 
   const stopCamera = () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current)
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
+    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
   }
 
-  const toggleTorch = async () => {
-    if (!streamRef.current) return
-    const track = streamRef.current.getVideoTracks()[0]
-    try {
-      await track.applyConstraints({ advanced: [{ torch: !torchOn }] })
-      setTorchOn(t => !t)
-    } catch (_) {}
-  }
-
-  // ── Grant camera with preference ─────────────────────────
   const grantCamera = (pref) => {
     if (pref === 'always') localStorage.setItem(PREF_KEY, 'always')
-    else if (pref === 'once') localStorage.removeItem(PREF_KEY) // don't persist
-    setSavedPref(pref)
     setPhase('requesting')
-  }
-
-  const denyCamera = () => {
-    localStorage.setItem(PREF_KEY, 'deny')
-    setPhase('denied')
   }
 
   return (
     <div style={{ background: '#000', minHeight: '100vh', position: 'relative', overflow: 'hidden' }}>
-
-      {/* ── CAMERA FEED (live behind everything) ── */}
-      <video
-        ref={videoRef}
-        playsInline
-        muted
-        style={{
-          position: 'absolute', inset: 0,
-          width: '100%', height: '100%',
-          objectFit: 'cover',
-          display: phase === 'scanning' ? 'block' : 'none',
-        }}
-      />
+      <video ref={videoRef} playsInline muted style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', display: phase === 'scanning' ? 'block' : 'none' }} />
       <canvas ref={canvasRef} style={{ display: 'none' }} />
 
-      {/* ── SCANNER UI OVERLAY (when scanning) ── */}
       <AnimatePresence>
         {phase === 'scanning' && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}
-          >
-            {/* Top bar */}
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '52px 20px 16px', background: 'linear-gradient(to bottom, rgba(0,0,0,0.7), transparent)' }}>
-              <button
-                onClick={() => { stopCamera(); navigate(-1) }}
-                style={{ width: '40px', height: '40px', borderRadius: '50%', background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
-              >
-                <ChevronLeft size={22} color="#fff" />
-              </button>
-              <p style={{ color: '#fff', fontSize: '15px', fontWeight: 700, margin: 0 }}>Scan QR Code</p>
-              <button
-                onClick={toggleTorch}
-                style={{ width: '40px', height: '40px', borderRadius: '50%', background: torchOn ? 'rgba(212,175,55,0.3)' : 'rgba(255,255,255,0.15)', border: `1px solid ${torchOn ? '#d4af37' : 'rgba(255,255,255,0.2)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
-              >
-                <Zap size={18} color={torchOn ? '#d4af37' : '#fff'} />
-              </button>
+              <button onClick={() => { stopCamera(); navigate(-1) }} style={{ width: '40px', height: '40px', borderRadius: '50%', background: 'rgba(255,255,255,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><ChevronLeft color="#fff" /></button>
+              <p style={{ color: '#fff', fontWeight: 700 }}>Scan QR Code</p>
+              <div style={{ width: '40px' }} />
             </div>
-
-            {/* Viewfinder cutout */}
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              {/* Dark overlay with viewfinder hole using box-shadow trick */}
-              <div style={{ position: 'relative', width: '260px', height: '260px' }}>
-                {/* Corner brackets - exact CCI scanner style */}
-                {[
-                  { top: 0,    left: 0,    borderTop: true,  borderLeft: true  },
-                  { top: 0,    right: 0,   borderTop: true,  borderRight: true },
-                  { bottom: 0, left: 0,    borderBottom: true, borderLeft: true },
-                  { bottom: 0, right: 0,   borderBottom: true, borderRight: true },
-                ].map((pos, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      position: 'absolute',
-                      width: '36px', height: '36px',
-                      ...pos,
-                      borderStyle: 'solid',
-                      borderColor: '#2C5F2D',
-                      borderWidth: 0,
-                      borderTopWidth:    pos.borderTop    ? '3px' : 0,
-                      borderBottomWidth: pos.borderBottom ? '3px' : 0,
-                      borderLeftWidth:   pos.borderLeft   ? '3px' : 0,
-                      borderRightWidth:  pos.borderRight  ? '3px' : 0,
-                      borderRadius: pos.borderTop && pos.borderLeft ? '8px 0 0 0' :
-                                    pos.borderTop && pos.borderRight ? '0 8px 0 0' :
-                                    pos.borderBottom && pos.borderLeft ? '0 0 0 8px' : '0 0 8px 0',
-                    }}
-                  />
+              <div style={{ width: '260px', height: '260px', border: '3px solid #2C5F2D', borderRadius: '24px', position: 'relative' }}>
+                <motion.div animate={{ y: [0, 240, 0] }} transition={{ duration: 2.5, repeat: Infinity }} style={{ position: 'absolute', inset: '0 8px', height: '2px', background: '#2C5F2D' }} />
+              </div>
+            </div>
+            <div style={{ padding: '24px', textAlign: 'center', background: 'linear-gradient(to top, #000, transparent)' }}>
+              <button onClick={() => { stopCamera(); setPhase('pin') }} style={{ padding: '14px 28px', borderRadius: '100px', background: '#2C5F2D', color: '#fff', fontWeight: 700, border: 'none' }}>Use PIN instead</button>
+            </div>
+          </motion.div>
+        )}
+
+        {phase === 'pin' && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ position: 'fixed', inset: 0, background: '#070d07', display: 'flex', flexDirection: 'column', padding: '24px', zIndex: 110 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '52px 0 32px' }}>
+              <button onClick={() => setPhase('idle')} style={{ color: '#555', background: 'transparent', border: 'none' }}><X size={28} /></button>
+              <h2 style={{ color: '#fff', fontSize: '18px', fontWeight: 800 }}>Manual Check-in</h2>
+              <div style={{ width: '28px' }} />
+            </div>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '40px' }}>
+              <div style={{ display: 'flex', gap: '16px' }}>
+                {[0,1,2,3].map(i => (
+                  <div key={i} style={{ width: '56px', height: '56px', borderRadius: '16px', border: `2.5px solid ${pin.length > i ? '#2C5F2D' : '#1a2e1a'}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {pin.length > i ? <span style={{ color: '#fff', fontSize: '24px', fontWeight: 900 }}>*</span> : <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#1a2e1a' }} />}
+                  </div>
                 ))}
-                {/* Scanning line animation */}
-                <motion.div
-                  animate={{ y: [0, 240, 0] }}
-                  transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
-                  style={{ position: 'absolute', left: '8px', right: '8px', height: '2px', background: 'linear-gradient(90deg, transparent, #2C5F2D, transparent)', borderRadius: '2px' }}
-                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', width: '100%', maxWidth: '320px' }}>
+                {[1,2,3,4,5,6,7,8,9].map(n => <button key={n} onClick={() => handlePIN(n.toString())} style={{ height: '62px', borderRadius: '16px', background: 'rgba(255,255,255,0.03)', color: '#fff', fontSize: '22px', fontWeight: 700 }}>{n}</button>)}
+                <button onClick={() => setPin('')} style={{ color: '#ff453a', fontWeight: 800 }}>RESET</button>
+                <button onClick={() => handlePIN('0')} style={{ height: '62px', borderRadius: '16px', background: 'rgba(255,255,255,0.03)', color: '#fff', fontSize: '22px', fontWeight: 700 }}>0</button>
+                <button onClick={() => setPin(p => p.slice(0,-1))} style={{ color: '#fff', fontSize: '20px' }}>⌫</button>
               </div>
             </div>
-
-            {/* Bottom hint */}
-            <div style={{ padding: '24px', background: 'linear-gradient(to top, rgba(0,0,0,0.8), transparent)', textAlign: 'center' }}>
-              <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: '14px', fontWeight: 500, margin: '0 0 16px' }}>
-                Point your camera at the Sunday service QR code
-              </p>
-              <button
-                onClick={() => { stopCamera(); navigate(-1) }}
-                style={{ padding: '12px 28px', borderRadius: '100px', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', color: '#fff', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
-              >
-                Cancel
-              </button>
+            <div style={{ padding: '24px 0' }}>
+              <button onClick={() => verifyAndCheckIn(pin, 'pin')} disabled={pin.length < 4 || loading} style={{ width: '100%', padding: '20px', borderRadius: '100px', background: pin.length === 4 ? '#2C5F2D' : 'rgba(255,255,255,0.05)', color: '#fff', fontWeight: 900, border: 'none' }}>{loading ? 'Verifying...' : 'Check In Now'}</button>
             </div>
           </motion.div>
         )}
-      </AnimatePresence>
 
-      {/* ════════════════════════════════════════════════════════
-          NATIVE-STYLE PERMISSION DIALOG (phase === 'idle')
-          Mimics iOS camera permission popup exactly
-          ════════════════════════════════════════════════════════ */}
-      <AnimatePresence>
-        {phase === 'idle' && (
-          <>
-            {/* Semi-transparent blur backdrop */}
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              style={{
-                position: 'fixed', inset: 0, zIndex: 100,
-                background: 'rgba(0,0,0,0.55)',
-                backdropFilter: 'blur(12px)',
-                WebkitBackdropFilter: 'blur(12px)',
-              }}
-            />
-
-            {/* Dialog card */}
-            <motion.div
-              initial={{ opacity: 0, scale: 0.88, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.92, y: 10 }}
-              transition={{ type: 'spring', damping: 28, stiffness: 260 }}
-              style={{
-                position: 'fixed',
-                top: '50%', left: '50%',
-                transform: 'translate(-50%, -50%)',
-                zIndex: 101,
-                width: 'min(320px, calc(100vw - 48px))',
-                borderRadius: '20px',
-                overflow: 'hidden',
-                background: 'rgba(44, 44, 48, 0.96)',
-                backdropFilter: 'blur(40px)',
-                WebkitBackdropFilter: 'blur(40px)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                boxShadow: '0 20px 60px rgba(0,0,0,0.6)',
-              }}
-            >
-              {/* Top section: icon + title + message */}
-              <div style={{ padding: '24px 24px 20px', textAlign: 'center' }}>
-                {/* Camera icon circle (green = Fruitbearers brand) */}
-                <div style={{
-                  width: '64px', height: '64px', borderRadius: '18px',
-                  background: '#2C5F2D',
-                  margin: '0 auto 14px',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  boxShadow: '0 4px 20px rgba(44,95,45,0.4)',
-                }}>
-                  {/* Camera SVG */}
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                    <circle cx="12" cy="13" r="4"/>
-                  </svg>
-                </div>
-
-                {/* App name */}
-                <p style={{ color: '#fff', fontSize: '17px', fontWeight: 700, margin: '0 0 8px', letterSpacing: '-0.2px' }}>
-                  "Fruitbearers" Would Like to Access Your Camera
-                </p>
-
-                {/* Reason */}
-                <p style={{ color: 'rgba(255,255,255,0.55)', fontSize: '13px', lineHeight: 1.5, margin: 0 }}>
-                  The camera is used to scan QR codes at Sunday service for automatic attendance check-in.
-                </p>
-              </div>
-
-              {/* Divider */}
-              <div style={{ height: '1px', background: 'rgba(255,255,255,0.1)', margin: '0' }} />
-
-              {/* Option buttons — exact iOS style (full-width divider-separated) */}
-              <div>
-                {/* Option 1: Allow Every Time */}
-                <button
-                  onClick={() => grantCamera('always')}
-                  style={optionStyle(false)}
-                >
-                  <span style={{ fontSize: '15px', fontWeight: 600, color: '#5ac8fa' }}>
-                    Allow Every Time
-                  </span>
-                  <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.35)', marginTop: '2px' }}>
-                    Camera opens automatically when scanning
-                  </span>
-                </button>
-
-                <div style={{ height: '1px', background: 'rgba(255,255,255,0.08)' }} />
-
-                {/* Option 2: Allow Once */}
-                <button
-                  onClick={() => grantCamera('once')}
-                  style={optionStyle(false)}
-                >
-                  <span style={{ fontSize: '15px', fontWeight: 600, color: '#5ac8fa' }}>
-                    Allow Once
-                  </span>
-                  <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.35)', marginTop: '2px' }}>
-                    You'll be asked again next time
-                  </span>
-                </button>
-
-                <div style={{ height: '1px', background: 'rgba(255,255,255,0.08)' }} />
-
-                {/* Option 3: Don't Allow */}
-                <button
-                  onClick={denyCamera}
-                  style={optionStyle(true)}
-                >
-                  <span style={{ fontSize: '15px', fontWeight: 500, color: '#ff453a' }}>
-                    Don't Allow
-                  </span>
-                </button>
-              </div>
-            </motion.div>
-          </>
-        )}
-      </AnimatePresence>
-
-      {/* ════════════════════
-          REQUESTING phase
-          ════════════════════ */}
-      {phase === 'requesting' && (
-        <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#000', gap: '16px' }}>
-          <motion.div
-            animate={{ rotate: 360 }}
-            transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
-            style={{ width: '40px', height: '40px', border: '3px solid #2a2a2a', borderTopColor: '#2C5F2D', borderRadius: '50%' }}
-          />
-          <p style={{ color: '#555', fontSize: '14px', fontWeight: 600 }}>Starting camera...</p>
-        </div>
-      )}
-
-      {/* ════════════════════
-          DENIED state
-          ════════════════════ */}
-      {phase === 'denied' && (
-        <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0e0e0e', padding: '32px', gap: '16px', textAlign: 'center' }}>
-          <div style={{ fontSize: '56px', marginBottom: '8px' }}>📷</div>
-          <h2 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, margin: 0 }}>Camera Access Denied</h2>
-          <p style={{ color: '#555', fontSize: '14px', lineHeight: 1.5, margin: 0 }}>
-            To scan QR codes, please enable camera access in your browser or device settings.
-          </p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', width: '100%', maxWidth: '280px', marginTop: '8px' }}>
-            <button
-              onClick={() => { localStorage.removeItem(PREF_KEY); setPhase('idle') }}
-              style={{ padding: '16px', borderRadius: '100px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '15px', border: 'none', cursor: 'pointer' }}
-            >
-              Try Again
-            </button>
-            <button
-              onClick={() => navigate(-1)}
-              style={{ padding: '16px', borderRadius: '100px', background: 'transparent', color: '#888', fontWeight: 600, fontSize: '15px', border: '1.5px solid #2a2a2a', cursor: 'pointer' }}
-            >
-              Go Back
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ════════════════════
-          SUCCESS state
-          ════════════════════ */}
-      <AnimatePresence>
         {phase === 'success' && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0e0e0e', padding: '32px', gap: '16px', textAlign: 'center' }}
-          >
-            {/* Animated checkmark */}
-            <motion.div
-              initial={{ scale: 0 }}
-              animate={{ scale: 1 }}
-              transition={{ type: 'spring', damping: 15, stiffness: 200, delay: 0.1 }}
-              style={{ width: '88px', height: '88px', borderRadius: '50%', background: '#1a2e10', border: '2px solid #2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '8px' }}
-            >
-              <motion.div
-                initial={{ opacity: 0, scale: 0 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: 0.3 }}
-                style={{ fontSize: '40px' }}
-              >
-                ✅
-              </motion.div>
-            </motion.div>
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0e0e0e', padding: '32px', textAlign: 'center', zIndex: 120 }}>
+            <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: '#1a2e10', border: '2px solid #2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '24px' }}>✅</div>
+            <h2 style={{ color: '#fff', fontSize: '24px', fontWeight: 700 }}>{checkInResult?.success ? 'Checked In! 🌿' : 'failed'}</h2>
+            <p style={{ color: checkInResult?.success ? '#2C5F2D' : '#ff453a', margin: '12px 0 32px' }}>{checkInResult?.success ? `Streak: ${checkInResult.streak} Fires` : checkInResult?.message}</p>
+            <button onClick={() => navigate('/home')} style={{ width: '100%', maxWidth: '280px', padding: '18px', borderRadius: '100px', background: '#2C5F2D', color: '#fff', fontWeight: 800 }}>Back to Home</button>
+          </motion.div>
+        )}
 
-            <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }}>
-              <h2 style={{ color: '#fff', fontSize: '24px', fontWeight: 700, margin: '0 0 8px', letterSpacing: '-0.3px' }}>
-                Checked In! 🌿
-              </h2>
-              {checkInResult?.success && (
-                <p style={{ color: '#2C5F2D', fontSize: '15px', fontWeight: 600, margin: '0 0 6px' }}>
-                  🔥 Streak: {checkInResult.streak} Sunday{checkInResult.streak !== 1 ? 's' : ''} in a row
-                </p>
-              )}
-              {scannedCode && (
-                <p style={{ color: '#444', fontSize: '11px', margin: '8px 0 0', fontFamily: 'monospace' }}>
-                  Code: {scannedCode}
-                </p>
-              )}
-            </motion.div>
-
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.6 }} style={{ width: '100%', maxWidth: '280px' }}>
-              <button
-                onClick={() => navigate('/home')}
-                style={{ width: '100%', padding: '17px', borderRadius: '100px', background: 'linear-gradient(135deg, #2C5F2D, #4a8c4b)', color: '#fff', fontWeight: 700, fontSize: '15px', border: 'none', cursor: 'pointer', boxShadow: '0 4px 20px rgba(44,95,45,0.35)' }}
-              >
-                Back to Home
-              </button>
-            </motion.div>
+        {phase === 'idle' && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.9)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}>
+            <div style={{ background: '#1c1c1e', width: 'min(320px, 90%)', borderRadius: '20px', padding: '32px 24px', textAlign: 'center' }}>
+              <div style={{ width: '64px', height: '64px', background: '#2C5F2D', borderRadius: '16px', margin: '0 auto 20px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Zap color="#fff" /></div>
+              <h3 style={{ color: '#fff', margin: '0 0 8px' }}>Camera Permission</h3>
+              <p style={{ color: '#888', fontSize: '13px', marginBottom: '24px' }}>Required to scan service QR codes.</p>
+              <button onClick={() => grantCamera('always')} style={{ width: '100%', padding: '14px', background: '#2C5F2D', color: '#fff', borderRadius: '12px', border: 'none', marginBottom: '12px' }}>Allow Camera</button>
+              <button onClick={() => setPhase('pin')} style={{ width: '100%', padding: '14px', background: 'rgba(255,255,255,0.05)', color: '#2C5F2D', borderRadius: '12px', border: 'none' }}>Use PIN instead</button>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* ════════════════════
-          ERROR state
-          ════════════════════ */}
-      {phase === 'error' && (
-        <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0e0e0e', padding: '32px', gap: '12px', textAlign: 'center' }}>
-          <div style={{ fontSize: '48px' }}>⚠️</div>
-          <h2 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, margin: 0 }}>Camera Error</h2>
-          <p style={{ color: '#555', fontSize: '14px', margin: 0 }}>Something went wrong starting the camera. Check your device settings.</p>
-          <button onClick={() => navigate(-1)} style={{ marginTop: '12px', padding: '14px 32px', borderRadius: '100px', background: '#1a1a1a', border: '1px solid #2a2a2a', color: '#fff', fontWeight: 600, fontSize: '14px', cursor: 'pointer' }}>
-            Go Back
-          </button>
-        </div>
-      )}
     </div>
   )
 }
-
-// ── Shared style for iOS-style option buttons ──────────────
-const optionStyle = (isDanger) => ({
-  display: 'flex',
-  flexDirection: 'column',
-  alignItems: 'center',
-  justifyContent: 'center',
-  width: '100%',
-  padding: isDanger ? '16px 24px' : '14px 24px',
-  background: 'transparent',
-  border: 'none',
-  cursor: 'pointer',
-  gap: '2px',
-  transition: 'background 0.1s',
-  WebkitTapHighlightColor: 'rgba(255,255,255,0.08)',
-})

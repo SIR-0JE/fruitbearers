@@ -14,7 +14,7 @@ export default function RootRedirect() {
       <AnimatePresence mode="wait">
         {!user ? (
           <LandingPage key="landing" />
-        ) : profile?.role === 'admin' ? (
+        ) : profile?.role?.toLowerCase() === 'admin' ? (
           <Navigate to="/admin" replace />
         ) : (
           <Navigate to="/home" replace />

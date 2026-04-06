@@ -40,6 +40,16 @@ export default function CheckInPage() {
       setSession(sess)
       return
     }
+
+    // ── Check Expiration ──
+    const now = new Date()
+    const expiry = new Date(sess.expires_at)
+    if (now > expiry) {
+      setStatus('invalid')
+      setSession(sess)
+      return
+    }
+
     setSession(sess)
 
     // Upsert attendance record (unique on user_id + session_id)
@@ -60,6 +70,24 @@ export default function CheckInPage() {
       }
       return
     }
+
+    // ── Perfected Streak Logic ──
+    const today = new Date().toISOString().split('T')[0]
+    const lastCheckin = profile?.last_checkin
+    let newStreak = profile?.attendance_streak || 0
+    
+    if (!lastCheckin) {
+      newStreak = 1
+    } else if (lastCheckin !== today) {
+      const lDate = new Date(lastCheckin)
+      const diffDays = Math.floor((new Date() - lDate) / (1000 * 60 * 60 * 24))
+      if (diffDays <= 8) newStreak += 1
+      else newStreak = 1
+    }
+
+    await supabase.from('profiles')
+      .update({ attendance_streak: newStreak, last_checkin: today })
+      .eq('id', user.id)
 
     setStatus('success')
 
@@ -104,12 +132,16 @@ export default function CheckInPage() {
             <h1 style={{ fontFamily: "'Playfair Display', serif", fontSize: '1.85rem', fontWeight: 800, color: 'var(--navy)', margin: '0 0 0.75rem' }}>
               Checked In! 🎉
             </h1>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem', margin: '0 0 1rem', fontWeight: 600 }}>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem', margin: '0 0 1.5rem', fontWeight: 600 }}>
               Welcome, <span style={{ color: 'var(--gold)' }}>{profile?.full_name}</span>
             </p>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: '0 0 2rem', letterSpacing: '0.02em' }}>
-              {dateLabel}
-            </p>
+            
+            <div style={{ background: 'rgba(212,175,55,0.08)', border: '1px solid rgba(212,175,55,0.15)', padding: '12px 20px', borderRadius: '100px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', margin: '0 auto 2rem', width: 'fit-content' }}>
+              <span style={{ fontSize: '18px' }}>🔥</span>
+              <span style={{ color: '#d4af37', fontSize: '14px', fontWeight: 900, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                {profile?.attendance_streak || 1} Fires Total
+              </span>
+            </div>
             <div
               style={{
                 background: 'var(--beige)',

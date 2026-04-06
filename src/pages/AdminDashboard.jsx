@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../contexts/AuthContext'
 import { useNavigate } from 'react-router-dom'
@@ -45,8 +45,8 @@ export default function AdminDashboard() {
   const loadStats = async () => {
     const today = new Date().toISOString().split('T')[0]
     const [m, a, s] = await Promise.all([
-      supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'member'),
-      supabase.from('attendance').select('id', { count: 'exact', head: true }).eq('session_date', today),
+      supabase.from('profiles').select('id', { count: 'exact', head: true }),
+      supabase.from('attendance_records').select('id', { count: 'exact', head: true }).gte('created_at', today),
       supabase.from('sermons').select('id', { count: 'exact', head: true }),
     ])
     setStats({ members: m.count || 0, checkins: a.count || 0, sermons: s.count || 0 })
@@ -200,19 +200,20 @@ function OverviewTab({ stats }) {
 
   const loadData = () => {
     const today = new Date().toISOString().split('T')[0]
-    supabase.from('profiles').select('id, full_name, email, campus, created_at').eq('role', 'member').order('created_at', { ascending: false }).limit(5)
+    supabase.from('profiles').select('id, full_name, email, campus, created_at').order('created_at', { ascending: false }).limit(5)
       .then(({ data }) => setRecentMembers(data || []))
-    supabase.from('attendance').select('user_id, checked_in_at, profiles(full_name)').eq('session_date', today).limit(10)
+    // Add sorting so the newest checkins rise to the top
+    supabase.from('attendance_records').select('user_id, created_at, profiles(full_name)').gte('created_at', today).order('created_at', { ascending: false }).limit(10)
       .then(({ data }) => setTodayAttendance(data || []))
   }
 
   useEffect(() => {
     loadData()
 
-    // 🔴 Real-time: update recent lists automatically
+    // 🔴 Real-time: Listen to ALL events (*) so 'upserted' profiles also show up instantly
     const channel = supabase.channel('overview-live')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'profiles' }, loadData)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'attendance' }, loadData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, loadData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_records' }, loadData)
       .subscribe()
 
     return () => supabase.removeChannel(channel)
@@ -225,9 +226,7 @@ function OverviewTab({ stats }) {
       {/* Stats grid */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '32px' }}>
         <StatCard icon="👥" label="Total Members" value={stats.members} sub="Active accounts" />
-        <StatCard icon="✅" label="Today's Check-ins" value={stats.checkins} sub="Sunday service" color="#d4af37" />
         <StatCard icon="🎙️" label="Sermons" value={stats.sermons} sub="In media library" color="#5ac8fa" />
-        <StatCard icon="🌿" label="Church" value="Bowen" sub="University campus" color="#a78bfa" />
       </div>
 
       {/* Admin Magic Link */}
@@ -301,92 +300,78 @@ function OverviewTab({ stats }) {
 }
 
 // ════════════════════════════════════
-// HOME PAGE TAB — Featured flier
+// HOME PAGE TAB — Flier Upload
 // ════════════════════════════════════
 function HomePageTab() {
-  const [current, setCurrent]   = useState('')
-  const [newUrl, setNewUrl]     = useState('')
-  const [saving, setSaving]     = useState(false)
-  const [saved, setSaved]       = useState(false)
-
-  const LOCAL_FLIERS = [
-    { label: 'Discovering Your Purpose — Part 3', path: '/sermons/discovering-your-purpose.jpg' },
-    { label: 'Join Us This Sunday',               path: '/sermons/join-us-sunday.jpg'           },
-    { label: 'Overcoming Your Background',        path: '/sermons/overcoming-your-background.jpg'},
-  ]
+  const [current, setCurrent]     = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [saved, setSaved]         = useState(false)
+  const fileInputRef              = useRef(null)
 
   useEffect(() => {
     supabase.from('app_settings').select('value').eq('key', 'featured_flier_url').single()
       .then(({ data }) => data && setCurrent(data.value))
   }, [])
 
-  const setFlier = async (url) => {
-    setSaving(true)
-    await supabase.from('app_settings').upsert({ key: 'featured_flier_url', value: url, updated_at: new Date().toISOString() })
-    setCurrent(url)
-    setSaved(true); setSaving(false)
-    setTimeout(() => setSaved(false), 2500)
+  const uploadFlier = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+
+    const ext  = file.name.split('.').pop()
+    const path = `fliers/sunday-flier-${Date.now()}.${ext}`
+
+    const { error: upErr } = await supabase.storage.from('media').upload(path, file, { upsert: true })
+    if (upErr) { alert('Upload failed: ' + upErr.message); setUploading(false); return }
+
+    const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(path)
+
+    await supabase.from('app_settings').upsert({ key: 'featured_flier_url', value: publicUrl })
+    setCurrent(publicUrl)
+    setSaved(true); setUploading(false)
+    setTimeout(() => setSaved(false), 3000)
   }
 
   return (
-    <PageWrap title="Home Page" subtitle="Control what members see on their home screen">
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', alignItems: 'start' }}>
-        {/* Current flier preview */}
+    <PageWrap title="Home Page" subtitle="Upload a flier — members see it instantly on their home screen">
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px', alignItems: 'start' }}>
+
+        {/* Live Preview */}
         <div>
-          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '12px' }}>Currently Displayed</p>
-          <div style={{ borderRadius: '16px', overflow: 'hidden', border: '1px solid rgba(44,95,45,0.3)', background: '#0d160d', marginBottom: '12px' }}>
+          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '12px' }}>Live on Member Home Screen</p>
+          <div style={{ borderRadius: '20px', overflow: 'hidden', border: '1px solid rgba(44,95,45,0.3)', background: '#0d160d', aspectRatio: '1/1', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             {current
-              ? <img src={current} alt="" style={{ width: '100%', display: 'block', objectFit: 'cover' }} />
-              : <div style={{ padding: '60px 20px', textAlign: 'center', color: '#333' }}>No flier selected</div>
+              ? <img src={current} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+              : <div style={{ textAlign: 'center', padding: '32px' }}>
+                  <p style={{ fontSize: '40px', marginBottom: '12px' }}>🖼️</p>
+                  <p style={{ color: '#555', fontSize: '13px', fontWeight: 600 }}>No flier uploaded yet</p>
+                  <p style={{ color: '#333', fontSize: '12px', marginTop: '6px' }}>Members will see a placeholder until you upload one</p>
+                </div>
             }
           </div>
-          {saved && (
-            <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 700 }}>✅ Flier updated — all members will see this now</p>
-          )}
+          {saved && <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 700, marginTop: '12px' }}>✅ Flier live — all members see it now!</p>}
         </div>
 
-        {/* Controls */}
+        {/* Upload Controls */}
         <div>
-          {/* Pick flier */}
-          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '12px' }}>Select Flier</p>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '24px' }}>
-            {LOCAL_FLIERS.map(f => (
-              <button
-                key={f.path}
-                onClick={() => setFlier(f.path)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: '14px',
-                  background: current === f.path ? '#1a2e1a' : '#0d160d',
-                  border: `1.5px solid ${current === f.path ? '#2C5F2D' : 'rgba(44,95,45,0.2)'}`,
-                  borderRadius: '14px', padding: '12px 16px', cursor: 'pointer', textAlign: 'left',
-                  transition: 'all 0.15s',
-                }}
-              >
-                <div style={{ width: '56px', height: '56px', borderRadius: '10px', overflow: 'hidden', flexShrink: 0 }}>
-                  <img src={f.path} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                </div>
-                <span style={{ color: current === f.path ? '#fff' : '#aaa', fontSize: '13px', fontWeight: 600, flex: 1 }}>{f.label}</span>
-                {current === f.path && <CheckCircle size={18} color="#2C5F2D" />}
-              </button>
-            ))}
-          </div>
+          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '12px' }}>Upload This Week's Flier</p>
 
-          {/* Custom URL */}
-          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>Or Paste Image URL</p>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <input
-              value={newUrl}
-              onChange={e => setNewUrl(e.target.value)}
-              placeholder="https://your-site.com/flier.jpg"
-              style={{ flex: 1, background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '12px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit' }}
-            />
-            <button
-              onClick={() => newUrl && setFlier(newUrl)}
-              disabled={!newUrl || saving}
-              style={{ padding: '12px 20px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '13px', border: 'none', cursor: 'pointer', flexShrink: 0, opacity: !newUrl ? 0.5 : 1 }}
-            >
-              {saving ? '...' : 'Set'}
-            </button>
+          {/* Hidden real file input */}
+          <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={uploadFlier} />
+
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            style={{ width: '100%', padding: '48px 24px', borderRadius: '20px', border: '2px dashed rgba(44,95,45,0.4)', background: '#070d07', color: '#2C5F2D', fontWeight: 700, fontSize: '15px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', transition: 'all 0.2s' }}
+          >
+            <span style={{ fontSize: '36px' }}>{uploading ? '⏳' : '📤'}</span>
+            {uploading ? 'Uploading...' : 'Click to upload flier'}
+            <span style={{ color: '#555', fontSize: '12px', fontWeight: 500 }}>PNG or JPG · Replaces current flier immediately</span>
+          </button>
+
+          <div style={{ marginTop: '20px', padding: '16px', background: '#0d160d', borderRadius: '14px', border: '1px solid rgba(44,95,45,0.15)' }}>
+            <p style={{ color: '#2C5F2D', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 8px' }}>How it works</p>
+            <p style={{ color: '#555', fontSize: '12px', lineHeight: 1.6, margin: 0 }}>Upload a new flier every Sunday. It replaces the previous one automatically. Members on the home screen will see the new image in real-time and can share it with friends.</p>
           </div>
         </div>
       </div>
@@ -407,20 +392,23 @@ function AttendanceTab() {
   // New session state
   const [sessions, setSessions] = useState([])
   const [showCreate, setShowCreate] = useState(false)
-  const [newSession, setNewSession] = useState({ name: 'Sunday Service', type: 'First Service' })
+  const [newSession, setNewSession] = useState({ name: 'Sunday Service', type: 'First Service', end_time: '' })
   const [activeSession, setActiveSession] = useState(null)
+  const [isCreating, setIsCreating] = useState(false)
 
   const load = async () => {
     setLoading(true)
     const [ { data: m }, { data: a }, { data: s } ] = await Promise.all([
       supabase.from('profiles').select('id, full_name, email, attendance_streak').eq('role', 'member'),
-      supabase.from('attendance').select('user_id, session_id').eq('service_date', date),
-      supabase.from('attendance_sessions').select('*').eq('service_date', date)
+      // ✅ FIXED: reading from attendance_records (same table users write to)
+      supabase.from('attendance_records').select('user_id, session_id').in(
+        'session_id',
+        (await supabase.from('attendance_sessions').select('id').eq('service_date', date)).data?.map(s => s.id) || []
+      ),
+      supabase.from('attendance_sessions').select('*').eq('service_date', date).order('created_at', { ascending: false })
     ])
     setMembers(m || [])
     setSessions(s || [])
-    
-    // If sessions exist, we can filter checkins. For now, show all for that day
     setCheckins((a || []).map(x => x.user_id))
     setLoading(false)
   }
@@ -428,29 +416,77 @@ function AttendanceTab() {
   useEffect(() => {
     load()
     const channel = supabase.channel(`attendance-${date}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance', filter: `service_date=eq.${date}` }, load)
+      // ✅ FIXED: listening to attendance_records
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_records' }, load)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_sessions' }, load)
       .subscribe()
     return () => supabase.removeChannel(channel)
   }, [date])
 
   const createSession = async () => {
+    if (!newSession.end_time) {
+      alert('Please set an end time for the session.')
+      return
+    }
+
+    setIsCreating(true)
     const pin = Math.floor(1000 + Math.random() * 9000).toString()
     const qrValue = crypto.randomUUID()
+    
+    // Combine date + end_time
+    const expiresAt = new Date(`${date}T${newSession.end_time}`).toISOString()
+
     const { data, error } = await supabase.from('attendance_sessions').insert({
       session_name: newSession.name,
       service_date: date,
       service_type: newSession.type,
       qr_code_value: qrValue,
       pin: pin,
-      expires_at: new Date(Date.now() + 6 * 3600000).toISOString() // 6 hours
+      expires_at: expiresAt,
+      is_active: true
     }).select().single()
     
     if (!error) {
       setActiveSession(data)
       setShowCreate(false)
       load()
+    } else {
+      console.error(error)
+      alert('Error creating session: ' + error.message)
     }
+    setIsCreating(false)
+  }
+
+  const downloadQR = () => {
+    const svg = document.getElementById('session-qr-svg')
+    if (!svg) return
+    const svgData = new XMLSerializer().serializeToString(svg)
+    const canvas = document.createElement('canvas')
+    const ctx = canvas.getContext('2d')
+    const img = new Image()
+    img.onload = () => {
+      canvas.width = 1000
+      canvas.height = 1000
+      ctx.fillStyle = 'white'
+      ctx.fillRect(0,0,1000,1000)
+      ctx.drawImage(img, 100, 100, 800, 800)
+      
+      // Add text info
+      ctx.fillStyle = 'black'
+      ctx.font = 'bold 40px Arial'
+      ctx.textAlign = 'center'
+      ctx.fillText(`FRUITBEARERS - ${activeSession?.service_type || 'Service'}`, 500, 940)
+      ctx.fillText(`PIN: ${activeSession?.pin}`, 500, 80)
+
+      const pngUrl = canvas.toDataURL('image/png')
+      const downloadLink = document.createElement('a')
+      downloadLink.href = pngUrl
+      downloadLink.download = `attendance-qr-${activeSession?.service_type}-${date}.png`
+      document.body.appendChild(downloadLink)
+      downloadLink.click()
+      document.body.removeChild(downloadLink)
+    }
+    img.src = 'data:image/svg+xml;base64,' + btoa(svgData)
   }
 
   const present = members.filter(m => checkins.includes(m.id))
@@ -556,36 +592,119 @@ function AttendanceTab() {
 
       <AnimatePresence>
         {emailTarget && <EmailModal member={emailTarget} date={date} onClose={() => setEmailTarget(null)} />}
+        
+        {/* CREATE SESSION MODAL */}
         {showCreate && (
-           <>
-             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowCreate(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 200 }} />
-             <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
-               style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 201, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '20px', padding: '28px', width: 'min(400px, calc(100vw - 40px))' }}
+           <div style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowCreate(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)' }} />
+             <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.9, y: 20 }}
+               style={{ position: 'relative', zIndex: 201, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '32px', width: 'min(440px, 100%)', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)' }}
              >
-               <h3 style={{ color: '#fff', fontWeight: 700, margin: '0 0 20px' }}>Create Attendance Session</h3>
-               
-               <div style={{ marginBottom: '16px' }}>
-                 <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', marginBottom: '8px' }}>Service Type</label>
-                 <select 
-                   value={newSession.type}
-                   onChange={e => setNewSession(p => ({ ...p, type: e.target.value }))}
-                   style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '12px', color: '#fff', outline: 'none' }}
-                 >
-                   <option>First Service</option>
-                   <option>Second Service</option>
-                   <option>Midweek Service</option>
-                   <option>Special Service</option>
-                 </select>
+               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+                <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 800, margin: 0 }}>Start New Session</h3>
+                <button onClick={() => setShowCreate(false)} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#555', borderRadius: '50%', width: '32px', height: '32px', cursor: 'pointer' }}><X size={18} /></button>
                </div>
+               
+               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                 <div>
+                   <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>Service Type</label>
+                   <select 
+                     value={newSession.type}
+                     onChange={e => setNewSession(p => ({ ...p, type: e.target.value }))}
+                     style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '14px', color: '#fff', outline: 'none', fontSize: '15px' }}
+                   >
+                     <option>First Service</option>
+                     <option>Second Service</option>
+                     <option>Midweek Service</option>
+                     <option>Special Service</option>
+                   </select>
+                 </div>
 
-               <button 
-                 onClick={createSession}
-                 style={{ width: '100%', padding: '14px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, border: 'none', cursor: 'pointer' }}
-               >
-                 Start Session
-               </button>
+                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                    <div>
+                      <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>Date</label>
+                      <input 
+                        type="date"
+                        value={date}
+                        onChange={e => setDate(e.target.value)}
+                        style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '14px', color: '#fff', outline: 'none', fontSize: '14px' }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>End Time</label>
+                      <input 
+                        type="time"
+                        value={newSession.end_time}
+                        onChange={e => setNewSession(p => ({ ...p, end_time: e.target.value }))}
+                        style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '14px', color: '#fff', outline: 'none', fontSize: '14px' }}
+                        required
+                      />
+                    </div>
+                 </div>
+
+                 <p style={{ color: '#444', fontSize: '12px', margin: 0, fontStyle: 'italic' }}>
+                   The QR code and PIN will automatically expire at the set end time.
+                 </p>
+
+                 <button 
+                   onClick={createSession}
+                   disabled={isCreating}
+                   style={{ width: '100%', padding: '16px', borderRadius: '14px', background: isCreating ? '#1a2e1a' : 'linear-gradient(135deg, #2C5F2D 0%, #4a8c4b 100%)', color: '#fff', fontWeight: 800, border: 'none', cursor: 'pointer', fontSize: '15px', marginTop: '8px', boxShadow: '0 10px 20px rgba(44,95,45,0.2)' }}
+                 >
+                   {isCreating ? 'Creating...' : 'Start Session'}
+                 </button>
+               </div>
              </motion.div>
-           </>
+           </div>
+        )}
+
+        {/* ACTIVE SESSION / QR DISPLAY MODAL */}
+        {activeSession && (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setActiveSession(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.92)', backdropFilter: 'blur(12px)' }} />
+            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
+               style={{ position: 'relative', zIndex: 301, width: 'min(440px, 100%)', textAlign: 'center' }}
+             >
+               <div style={{ background: '#fff', borderRadius: '32px', padding: '40px', color: '#000', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}>
+                 <p style={{ color: '#2C5F2D', fontSize: '11px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: '8px' }}>Active Attendance</p>
+                 <h2 style={{ fontSize: '24px', fontWeight: 900, margin: '0 0 4px', color: '#0d160d' }}>{activeSession.service_type}</h2>
+                 <p style={{ color: '#888', fontSize: '14px', marginBottom: '32px' }}>Members can scan this code to check in</p>
+                 
+                 <div style={{ background: '#f8faf8', border: '1px solid #eee', borderRadius: '24px', padding: '30px', marginBottom: '32px', display: 'flex', justifyContent: 'center' }}>
+                   <QRCodeSVG id="session-qr-svg" value={`${window.location.origin}/check-in/${activeSession.id}`} size={240} level="H" bgColor="#f8faf8" fgColor="#0d160d" includeMargin />
+                 </div>
+
+                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '24px' }}>
+                   <div style={{ background: '#f8faf8', padding: '16px', borderRadius: '16px', border: '1px solid #eee' }}>
+                     <p style={{ fontSize: '10px', color: '#888', fontWeight: 700, textTransform: 'uppercase', marginBottom: '4px' }}>4-Digit PIN</p>
+                     <p style={{ fontSize: '28px', color: '#2C5F2D', fontWeight: 900, margin: 0, letterSpacing: '8px' }}>{activeSession.pin}</p>
+                   </div>
+                   <div style={{ background: '#f8faf8', padding: '16px', borderRadius: '16px', border: '1px solid #eee' }}>
+                     <p style={{ fontSize: '10px', color: '#888', fontWeight: 700, textTransform: 'uppercase', marginBottom: '4px' }}>Expires At</p>
+                     <p style={{ fontSize: '20px', color: '#0d160d', fontWeight: 800, margin: '6px 0 0' }}>
+                       {new Date(activeSession.expires_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}
+                     </p>
+                   </div>
+                 </div>
+
+                 <div style={{ display: 'flex', gap: '12px' }}>
+                    <button
+                      onClick={downloadQR}
+                      style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: '16px', borderRadius: '16px', background: '#0d160d', color: '#fff', border: 'none', fontWeight: 700, cursor: 'pointer' }}
+                    >
+                      <Upload size={18} /> Download
+                    </button>
+                    <button
+                      onClick={() => setActiveSession(null)}
+                      style={{ flex: 1, padding: '16px', borderRadius: '16px', background: '#eee', color: '#555', border: 'none', fontWeight: 700, cursor: 'pointer' }}
+                    >
+                      Close
+                    </button>
+                 </div>
+               </div>
+               <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '12px', marginTop: '24px' }}>Session remains active until the end time or until manual deletion.</p>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
     </PageWrap>
@@ -711,35 +830,93 @@ function MembersTab() {
 // MEDIA TAB
 // ════════════════════════════════════
 function MediaTab() {
-  const [sermons, setSermons] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [showAdd, setShowAdd] = useState(false)
-  const [form, setForm] = useState({ title: '', series: '', speaker: '', date: '', duration: '', thumbnail_url: '', audio_url: '' })
-  const [saving, setSaving] = useState(false)
+  const [sermons, setSermons]   = useState([])
+  const [photos, setPhotos]     = useState([])
+  const [loading, setLoading]   = useState(true)
+  const [showAdd, setShowAdd]   = useState(false)
+  const [mediaType, setMediaType] = useState('sermon') // 'sermon' | 'photo'
+  const [form, setForm]         = useState({ title: '', series: '', speaker: '', date: new Date().toISOString().split('T')[0], duration: '' })
+  const [thumbFile, setThumbFile]   = useState(null)
+  const [audioFile, setAudioFile]   = useState(null)
+  const [photoFiles, setPhotoFiles] = useState([])
+  const [saving, setSaving]     = useState(false)
+  const [progress, setProgress] = useState('')
+
+  const thumbRef  = useRef(null)
+  const audioRef  = useRef(null)
+  const photoRef  = useRef(null)
 
   const load = () => {
     setLoading(true)
-    supabase.from('sermons').select('*').order('date', { ascending: false })
-      .then(({ data }) => { setSermons(data || []); setLoading(false) })
+    Promise.all([
+      supabase.from('sermons').select('*').order('date', { ascending: false }),
+      supabase.from('media_gallery').select('*').order('created_at', { ascending: false })
+    ]).then(([{ data: s }, { data: p }]) => {
+      setSermons(s || [])
+      setPhotos(p || [])
+      setLoading(false)
+    })
   }
 
   useEffect(() => {
     load()
-
-    // 🔴 Real-time: update media tab
     const channel = supabase.channel('admin-media-live')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'sermons' }, load)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'media_gallery' }, load)
       .subscribe()
-
     return () => supabase.removeChannel(channel)
   }, [])
 
+  // Upload a file to Supabase Storage and return its public URL
+  const uploadFile = async (file, bucket, folder) => {
+    const ext  = file.name.split('.').pop()
+    const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`
+    const { error } = await supabase.storage.from(bucket).upload(path, file)
+    if (error) throw error
+    return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl
+  }
+
   const saveSermon = async () => {
+    if (!form.title) return
     setSaving(true)
-    await supabase.from('sermons').insert({ ...form, audio_url: form.audio_url || '' })
-    setSaving(false); setShowAdd(false)
-    setForm({ title: '', series: '', speaker: '', date: '', duration: '', thumbnail_url: '', audio_url: '' })
-    load()
+    try {
+      setProgress('Uploading thumbnail...')
+      const thumbUrl = thumbFile ? await uploadFile(thumbFile, 'media', 'thumbnails') : ''
+      setProgress('Uploading audio...')
+      const audioUrl = audioFile ? await uploadFile(audioFile, 'media', 'sermons') : ''
+      setProgress('Saving...')
+      await supabase.from('sermons').insert({ ...form, thumbnail_url: thumbUrl, audio_url: audioUrl })
+      setShowAdd(false)
+      setForm({ title: '', series: '', speaker: '', date: new Date().toISOString().split('T')[0], duration: '' })
+      setThumbFile(null); setAudioFile(null)
+      load()
+    } catch (e) {
+      alert('Upload error: ' + e.message)
+    }
+    setSaving(false); setProgress('')
+  }
+
+  const savePhotos = async () => {
+    if (!photoFiles.length) return
+    setSaving(true)
+    try {
+      for (let i = 0; i < photoFiles.length; i++) {
+        setProgress(`Uploading photo ${i + 1} of ${photoFiles.length}...`)
+        const url = await uploadFile(photoFiles[i], 'media', 'gallery')
+        await supabase.from('media_gallery').insert({
+          title: form.title || 'Church Photo',
+          image_url: url,
+          date: form.date,
+        })
+      }
+      setShowAdd(false)
+      setPhotoFiles([])
+      setForm({ title: '', series: '', speaker: '', date: new Date().toISOString().split('T')[0], duration: '' })
+      load()
+    } catch (e) {
+      alert('Upload error: ' + e.message)
+    }
+    setSaving(false); setProgress('')
   }
 
   const deleteSermon = async (id) => {
@@ -748,78 +925,169 @@ function MediaTab() {
     setSermons(prev => prev.filter(s => s.id !== id))
   }
 
+  const deletePhoto = async (id) => {
+    if (!confirm('Delete this photo?')) return
+    await supabase.from('media_gallery').delete().eq('id', id)
+    setPhotos(prev => prev.filter(p => p.id !== id))
+  }
+
+  const inputStyle = { width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }
+  const labelStyle = { display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '6px' }
+
   return (
     <PageWrap
       title="Media Library"
-      subtitle={`${sermons.length} sermon${sermons.length !== 1 ? 's' : ''} uploaded`}
+      subtitle={`${sermons.length} sermon${sermons.length !== 1 ? 's' : ''} · ${photos.length} photo${photos.length !== 1 ? 's' : ''}`}
       action={
-        <button
-          onClick={() => setShowAdd(true)}
-          style={{ display: 'flex', alignItems: 'center', gap: '7px', padding: '11px 20px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '14px', border: 'none', cursor: 'pointer' }}
-        >
-          + Add Sermon
+        <button onClick={() => setShowAdd(true)} style={{ display: 'flex', alignItems: 'center', gap: '7px', padding: '11px 20px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '14px', border: 'none', cursor: 'pointer' }}>
+          + Add Media
         </button>
       }
     >
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px' }}>
-        {sermons.map(s => (
-          <div key={s.id} style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '16px', overflow: 'hidden' }}>
-            <div style={{ width: '100%', aspectRatio: '16/9', background: '#111', overflow: 'hidden' }}>
-              <img src={s.thumbnail_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-            </div>
-            <div style={{ padding: '14px' }}>
-              <p style={{ color: '#fff', fontSize: '14px', fontWeight: 700, margin: '0 0 4px', lineHeight: 1.2 }}>{s.title}</p>
-              <p style={{ color: '#555', fontSize: '12px', margin: '0 0 12px' }}>{s.series} · {s.date}</p>
-              <button
-                onClick={() => deleteSermon(s.id)}
-                style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 12px', borderRadius: '8px', background: '#2e1a1a', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444', fontSize: '11px', fontWeight: 700, cursor: 'pointer' }}
-              >
-                <Trash2 size={11} /> Delete
-              </button>
-            </div>
+      {/* Sermons Grid */}
+      {sermons.length > 0 && (
+        <>
+          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '14px' }}>Sermons</p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px', marginBottom: '32px' }}>
+            {sermons.map(s => (
+              <div key={s.id} style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '16px', overflow: 'hidden' }}>
+                <div style={{ width: '100%', aspectRatio: '16/9', background: '#111' }}>
+                  <img src={s.thumbnail_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                </div>
+                <div style={{ padding: '14px' }}>
+                  <p style={{ color: '#fff', fontSize: '14px', fontWeight: 700, margin: '0 0 4px' }}>{s.title}</p>
+                  <p style={{ color: '#555', fontSize: '12px', margin: '0 0 12px' }}>{s.series} · {s.date}</p>
+                  <button onClick={() => deleteSermon(s.id)} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 12px', borderRadius: '8px', background: '#2e1a1a', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444', fontSize: '11px', fontWeight: 700, cursor: 'pointer' }}>
+                    <Trash2 size={11} /> Delete
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </>
+      )}
 
-      {/* Add sermon modal */}
+      {/* Photos Grid */}
+      {photos.length > 0 && (
+        <>
+          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '14px' }}>Photo Gallery</p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '12px' }}>
+            {photos.map(p => (
+              <div key={p.id} style={{ position: 'relative', borderRadius: '12px', overflow: 'hidden', aspectRatio: '1/1' }}>
+                <img src={p.image_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                <button onClick={() => deletePhoto(p.id)} style={{ position: 'absolute', top: '8px', right: '8px', background: 'rgba(0,0,0,0.6)', border: 'none', borderRadius: '8px', padding: '4px 8px', color: '#ef4444', cursor: 'pointer', fontSize: '12px' }}>
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {!loading && sermons.length === 0 && photos.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '80px 40px', color: '#333' }}>
+          <p style={{ fontSize: '48px' }}>🎙️</p>
+          <p style={{ fontSize: '14px', fontWeight: 600, marginTop: '12px' }}>No media uploaded yet</p>
+          <p style={{ fontSize: '12px', marginTop: '4px' }}>Click "+ Add Media" to upload your first sermon or photo</p>
+        </div>
+      )}
+
+      {/* Add Media Modal */}
       <AnimatePresence>
         {showAdd && (
           <>
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowAdd(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 200 }} />
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { if (!saving) setShowAdd(false) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 200 }} />
             <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
-              style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 201, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '20px', padding: '28px', width: 'min(480px, calc(100vw - 40px))' }}
+              style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 201, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '28px', width: 'min(500px, calc(100vw - 40px))', maxHeight: '90vh', overflowY: 'auto' }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                <h3 style={{ color: '#fff', fontWeight: 700, margin: 0 }}>Add Sermon</h3>
-                <button onClick={() => setShowAdd(false)} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer' }}><X size={20} /></button>
+                <h3 style={{ color: '#fff', fontWeight: 800, margin: 0, fontSize: '18px' }}>Add Media</h3>
+                <button onClick={() => { if (!saving) setShowAdd(false) }} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer' }}><X size={20} /></button>
               </div>
-              {[
-                { key: 'title', label: 'Title', placeholder: 'Sermon title' },
-                { key: 'series', label: 'Series', placeholder: 'e.g. Pathlighters Academy' },
-                { key: 'speaker', label: 'Speaker', placeholder: 'Speaker name' },
-                { key: 'date', label: 'Date', type: 'date' },
-                { key: 'duration', label: 'Duration', placeholder: '53:00' },
-                { key: 'thumbnail_url', label: 'Thumbnail URL', placeholder: 'https://...' },
-                { key: 'audio_url', label: 'Audio URL (optional)', placeholder: 'https://...' },
-              ].map(f => (
-                <div key={f.key} style={{ marginBottom: '14px' }}>
-                  <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '6px' }}>{f.label}</label>
-                  <input
-                    type={f.type || 'text'}
-                    value={form[f.key]}
-                    onChange={e => setForm(p => ({ ...p, [f.key]: e.target.value }))}
-                    placeholder={f.placeholder}
-                    style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }}
-                  />
-                </div>
-              ))}
-              <button
-                onClick={saveSermon}
-                disabled={!form.title || saving}
-                style={{ width: '100%', marginTop: '8px', padding: '13px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '14px', border: 'none', cursor: 'pointer', opacity: !form.title ? 0.5 : 1 }}
-              >
-                {saving ? 'Saving...' : 'Save Sermon'}
-              </button>
+
+              {/* Type Selector */}
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '24px', background: '#070d07', padding: '4px', borderRadius: '12px' }}>
+                {['sermon', 'photo'].map(t => (
+                  <button key={t} onClick={() => setMediaType(t)}
+                    style={{ flex: 1, padding: '10px', borderRadius: '10px', background: mediaType === t ? '#2C5F2D' : 'transparent', color: '#fff', fontWeight: 700, border: 'none', cursor: 'pointer', fontSize: '14px', textTransform: 'capitalize' }}
+                  >
+                    {t === 'sermon' ? '🎙️ Audio Sermon' : '📸 Photos'}
+                  </button>
+                ))}
+              </div>
+
+              {mediaType === 'sermon' ? (
+                <>
+                  {[{ key: 'title', label: 'Sermon Title *', ph: 'e.g. Walking in Faith' }, { key: 'series', label: 'Series', ph: 'e.g. Pathlighters Academy' }, { key: 'speaker', label: 'Speaker', ph: 'Speaker name' }, { key: 'duration', label: 'Duration', ph: '52:00' }].map(f => (
+                    <div key={f.key} style={{ marginBottom: '14px' }}>
+                      <label style={labelStyle}>{f.label}</label>
+                      <input value={form[f.key]} onChange={e => setForm(p => ({ ...p, [f.key]: e.target.value }))} placeholder={f.ph} style={inputStyle} />
+                    </div>
+                  ))}
+                  <div style={{ marginBottom: '14px' }}>
+                    <label style={labelStyle}>Date</label>
+                    <input type="date" value={form.date} onChange={e => setForm(p => ({ ...p, date: e.target.value }))} style={inputStyle} />
+                  </div>
+
+                  {/* Thumbnail upload */}
+                  <div style={{ marginBottom: '14px' }}>
+                    <label style={labelStyle}>Thumbnail Image *</label>
+                    <input ref={thumbRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={e => setThumbFile(e.target.files?.[0])} />
+                    <button onClick={() => thumbRef.current?.click()} style={{ width: '100%', padding: '14px', borderRadius: '12px', border: '2px dashed rgba(44,95,45,0.3)', background: '#070d07', color: thumbFile ? '#2C5F2D' : '#555', fontWeight: 600, cursor: 'pointer' }}>
+                      {thumbFile ? `✅ ${thumbFile.name}` : '📷 Choose thumbnail image'}
+                    </button>
+                  </div>
+
+                  {/* Audio upload */}
+                  <div style={{ marginBottom: '20px' }}>
+                    <label style={labelStyle}>Audio File (MP3 / M4A)</label>
+                    <input ref={audioRef} type="file" accept="audio/*" style={{ display: 'none' }} onChange={e => setAudioFile(e.target.files?.[0])} />
+                    <button onClick={() => audioRef.current?.click()} style={{ width: '100%', padding: '14px', borderRadius: '12px', border: '2px dashed rgba(44,95,45,0.3)', background: '#070d07', color: audioFile ? '#2C5F2D' : '#555', fontWeight: 600, cursor: 'pointer' }}>
+                      {audioFile ? `✅ ${audioFile.name}` : '🎵 Choose audio file'}
+                    </button>
+                  </div>
+
+                  {progress && <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 600, marginBottom: '12px' }}>{progress}</p>}
+                  <button onClick={saveSermon} disabled={!form.title || saving || !thumbFile} style={{ width: '100%', padding: '14px', borderRadius: '12px', background: form.title && thumbFile ? '#2C5F2D' : '#1a2e1a', color: '#fff', fontWeight: 800, border: 'none', cursor: 'pointer', opacity: (!form.title || !thumbFile) ? 0.5 : 1 }}>
+                    {saving ? progress || 'Uploading...' : 'Save Sermon'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div style={{ marginBottom: '14px' }}>
+                    <label style={labelStyle}>Caption / Title (optional)</label>
+                    <input value={form.title} onChange={e => setForm(p => ({ ...p, title: e.target.value }))} placeholder="e.g. Sunday Highlights June 2025" style={inputStyle} />
+                  </div>
+                  <div style={{ marginBottom: '20px' }}>
+                    <label style={labelStyle}>Date</label>
+                    <input type="date" value={form.date} onChange={e => setForm(p => ({ ...p, date: e.target.value }))} style={inputStyle} />
+                  </div>
+
+                  {/* Photo picker */}
+                  <input ref={photoRef} type="file" accept="image/*" multiple style={{ display: 'none' }} onChange={e => setPhotoFiles(Array.from(e.target.files))} />
+                  <button onClick={() => photoRef.current?.click()} style={{ width: '100%', padding: '40px 24px', borderRadius: '16px', border: '2px dashed rgba(44,95,45,0.3)', background: '#070d07', color: photoFiles.length ? '#2C5F2D' : '#555', fontWeight: 600, cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', marginBottom: '20px' }}>
+                    <span style={{ fontSize: '32px' }}>{photoFiles.length ? '✅' : '📸'}</span>
+                    {photoFiles.length ? `${photoFiles.length} photo${photoFiles.length > 1 ? 's' : ''} selected` : 'Click to choose photos'}
+                    <span style={{ fontSize: '12px', color: '#444' }}>You can select multiple at once</span>
+                  </button>
+
+                  {/* Preview thumbnails */}
+                  {photoFiles.length > 0 && (
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', marginBottom: '20px' }}>
+                      {photoFiles.map((f, i) => (
+                        <div key={i} style={{ aspectRatio: '1/1', borderRadius: '8px', overflow: 'hidden', background: '#111' }}>
+                          <img src={URL.createObjectURL(f)} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {progress && <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 600, marginBottom: '12px' }}>{progress}</p>}
+                  <button onClick={savePhotos} disabled={!photoFiles.length || saving} style={{ width: '100%', padding: '14px', borderRadius: '12px', background: photoFiles.length ? '#2C5F2D' : '#1a2e1a', color: '#fff', fontWeight: 800, border: 'none', cursor: 'pointer', opacity: !photoFiles.length ? 0.5 : 1 }}>
+                    {saving ? progress || 'Uploading...' : `Upload ${photoFiles.length || ''} Photo${photoFiles.length !== 1 ? 's' : ''}`}
+                  </button>
+                </>
+              )}
             </motion.div>
           </>
         )}
@@ -925,6 +1193,88 @@ function EmailModal({ member, date, onClose }) {
   )
 }
 
+// ── User Profile Detail Modal ────────────────────────────
+function UserProfileModal({ member, onClose }) {
+  const downloadAvatar = async () => {
+    if (!member.avatar_url) return;
+    try {
+      // Use Supabase client to bypass browser CORS restrictions securely
+      const path = member.avatar_url.split('/avatars/')[1];
+      if (!path) throw new Error('Invalid path format');
+
+      const { data, error } = await supabase.storage.from('avatars').download(path);
+      if (error) throw error;
+
+      const url = window.URL.createObjectURL(data);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${member.full_name?.replace(/ /g, '_') || 'Member'}_Avatar.jpg`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('Could not download image securely. Please try right-clicking and saving the image.');
+      console.error(e);
+    }
+  }
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 400, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose}
+        style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)' }} />
+      <motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 20 }}
+        style={{ position: 'relative', zIndex: 401, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '32px', width: 'min(400px, 100%)', boxShadow: '0 30px 60px -15px rgba(0,0,0,0.8)' }}
+      >
+        <div style={{ position: 'absolute', top: '24px', right: '24px' }}>
+          <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#555', borderRadius: '50%', width: '32px', height: '32px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><X size={16} /></button>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: '24px' }}>
+          <div style={{ position: 'relative', marginBottom: '16px' }}>
+            <div style={{ width: '120px', height: '120px', borderRadius: '36px', background: '#1a1a1a', border: '2px solid rgba(212,175,55,0.3)', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 10px 30px rgba(0,0,0,0.5)' }}>
+               {member.avatar_url ? <img src={member.avatar_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <Users size={40} color="#555" />}
+            </div>
+            {member.avatar_url && (
+              <button 
+                onClick={downloadAvatar} 
+                title="Download Photo"
+                style={{ position: 'absolute', bottom: '-10px', right: '-10px', width: '40px', height: '40px', borderRadius: '50%', background: '#2C5F2D', color: '#fff', border: '3px solid #0d160d', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 4px 12px rgba(0,0,0,0.3)', transition: 'all 0.2s' }}
+              >
+                 <Upload size={18} style={{ transform: 'rotate(180deg)' }} />
+              </button>
+            )}
+          </div>
+          <h2 style={{ color: '#fff', fontSize: '20px', fontWeight: 800, margin: '0 0 4px', textAlign: 'center' }}>{member.full_name}</h2>
+          <p style={{ color: member.role === 'admin' ? '#2C5F2D' : '#d4af37', fontSize: '11px', fontWeight: 800, margin: 0, textTransform: 'uppercase', letterSpacing: '0.15em' }}>
+            {member.role || 'Member'}
+          </p>
+        </div>
+
+        <div style={{ background: '#070d07', borderRadius: '16px', padding: '24px', display: 'grid', gap: '20px' }}>
+           <DetailRow icon={<Mail size={16} />} label="Email Address" value={member.email} />
+           <DetailRow icon={<PhoneOutgoing size={16} />} label="Phone Number" value={member.phone || 'Not provided'} />
+           <DetailRow icon={<Calendar size={16} />} label="Date of Birth" value={member.dob ? new Date(member.dob).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : 'Not provided'} />
+           <DetailRow icon={<Heart size={16} />} label="Wisdom House" value={member.wisdom_house || 'Not assigned'} />
+           <DetailRow icon={<TrendingUp size={16} />} label="Attendance Streak" value={`🔥 ${member.attendance_streak || 0} consecutive Sundays`} />
+        </div>
+      </motion.div>
+    </div>
+  )
+}
+
+function DetailRow({ icon, label, value }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+      <div style={{ color: '#555', background: '#111', width: '32px', height: '32px', borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{icon}</div>
+      <div>
+        <p style={{ color: '#666', fontSize: '10px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.05em', margin: '0 0 2px' }}>{label}</p>
+        <p style={{ color: '#eee', fontSize: '13px', fontWeight: 600, margin: 0 }}>{value}</p>
+      </div>
+    </div>
+  )
+}
+
 // ════════════════════════════════════
 // BIRTHDAY TAB
 // ════════════════════════════════════
@@ -932,6 +1282,7 @@ function BirthdayTab() {
   const [filter, setFilter] = useState('Today')
   const [loading, setLoading] = useState(true)
   const [members, setMembers] = useState([])
+  const [selectedMember, setSelectedMember] = useState(null)
 
   const load = async () => {
     setLoading(true)
@@ -968,15 +1319,15 @@ function BirthdayTab() {
     >
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
         {members.map(m => (
-          <div key={m.id} style={{ background: '#0d160d', border: '1px solid rgba(212,175,55,0.1)', borderRadius: '24px', padding: '24px', display: 'flex', alignItems: 'center', gap: '16px' }}>
-             <div style={{ width: '56px', height: '56px', borderRadius: '18px', background: '#2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-               <Gift size={24} color="#fff" />
+          <div key={m.id} onClick={() => setSelectedMember(m)} style={{ background: '#0d160d', border: '1px solid rgba(212,175,55,0.1)', borderRadius: '24px', padding: '24px', display: 'flex', alignItems: 'center', gap: '16px', cursor: 'pointer', transition: 'all 0.2s', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}>
+             <div style={{ width: '56px', height: '56px', borderRadius: '18px', background: m.avatar_url ? 'transparent' : '#2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, overflow: 'hidden' }}>
+               {m.avatar_url ? <img src={m.avatar_url} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <Gift size={24} color="#fff" />}
              </div>
              <div style={{ flex: 1 }}>
                <p style={{ color: '#fff', fontSize: '15px', fontWeight: 700, margin: '0 0 4px' }}>{m.full_name}</p>
                <p style={{ color: '#555', fontSize: '12px', fontWeight: 600, margin: 0 }}>{new Date(m.dob).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}</p>
              </div>
-             <a href={`https://wa.me/${m.phone}?text=Happy%20Birthday%20${m.full_name}!%20🌿`} target="_blank" rel="noreferrer" style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#1a2e1a', color: '#2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid rgba(44,95,45,0.2)' }}>
+             <a href={`https://wa.me/${m.phone}?text=Happy%20Birthday%20${m.full_name}!%20🌿`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#1a2e1a', color: '#2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid rgba(44,95,45,0.2)' }}>
                <MessageCircle size={18} />
              </a>
           </div>
@@ -987,6 +1338,10 @@ function BirthdayTab() {
            </div>
         )}
       </div>
+
+      <AnimatePresence>
+        {selectedMember && <UserProfileModal member={selectedMember} onClose={() => setSelectedMember(null)} />}
+      </AnimatePresence>
     </PageWrap>
   )
 }

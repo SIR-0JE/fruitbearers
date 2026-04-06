@@ -56,16 +56,17 @@ export default function HomeScreen() {
 
       // 4. Check if already checked-in today
       if (profile?.id) {
+        // ✅ FIXED: Now correctly checks the unified `attendance_records` table
         const { data: todayRec } = await supabase
-          .from('attendance')
-          .select('*, session:session_id(*)')
+          .from('attendance_records')
+          .select('*, attendance_sessions(*)')
           .eq('user_id', profile.id)
-          .eq('service_date', today)
+          .gte('created_at', today)
           .limit(1)
         
         if (todayRec?.length) {
           setCheckedInToday(true)
-          setSessionInfo(todayRec[0].session || { service_type: todayRec[0].service_type })
+          setSessionInfo(todayRec[0].attendance_sessions || { service_type: 'Sunday Service' })
         }
       }
     }
@@ -107,43 +108,56 @@ export default function HomeScreen() {
     setCheckingPin(true)
     setCheckInError(null)
 
-    // 1. Check for session with this PIN active today
-    const { data: session, error: sErr } = await supabase
+    const today = new Date().toISOString().split('T')[0]
+
+    // 1. Find active session for this PIN today
+    const { data: sessions, error: sErr } = await supabase
       .from('attendance_sessions')
       .select('*')
       .eq('pin', code)
       .eq('service_date', today)
       .limit(1)
     
-    if (sErr || !session?.length) {
-      setCheckInError('Invalid PIN or session not active')
+    if (sErr || !sessions?.length) {
+      setCheckInError('Invalid PIN or no active session today')
       setCheckingPin(false)
       return
     }
 
-    const targetSession = session[0]
+    const targetSession = sessions[0]
 
-    // 2. Record attendance
+    // 2. Check expiry
+    if (new Date(targetSession.expires_at) < new Date()) {
+      setCheckInError('This session has expired')
+      setCheckingPin(false)
+      return
+    }
+
+    // 3. Record attendance in attendance_records (same table admin reads)
     const { error: aErr } = await supabase
-      .from('attendance')
-      .insert({
-        user_id: profile.id,
-        session_id: targetSession.id,
-        service_date: targetSession.service_date,
-        service_type: targetSession.service_type,
-        method: 'code'
-      })
+      .from('attendance_records')
+      .insert({ user_id: profile.id, session_id: targetSession.id })
 
     if (aErr) {
-      if (aErr.code === '23505') setCheckInError('Already checked in!')
+      if (aErr.code === '23505') setCheckInError('Already checked in for this session!')
       else setCheckInError('Check-in failed. Try again.')
       setCheckingPin(false)
       return
     }
 
-    // 3. Success logic
-    const newStreak = streak + 1
-    await supabase.from('profiles').update({ attendance_streak: newStreak, last_checkin: today }).eq('id', profile.id)
+    // 4. Consecutive Sunday streak logic
+    const lastCheckin = profile.last_checkin
+    let newStreak = profile.attendance_streak || 0
+    if (!lastCheckin) {
+      newStreak = 1
+    } else if (lastCheckin !== today) {
+      const diffDays = Math.floor((new Date() - new Date(lastCheckin)) / (1000 * 60 * 60 * 24))
+      newStreak = diffDays <= 8 ? newStreak + 1 : 1
+    }
+
+    await supabase.from('profiles')
+      .update({ attendance_streak: newStreak, last_checkin: today })
+      .eq('id', profile.id)
     
     setStreak(newStreak)
     setSessionInfo(targetSession)
@@ -158,12 +172,18 @@ export default function HomeScreen() {
   }
 
   const shareFlier = async () => {
-    if (navigator.share && featuredFlier) {
+    if (!featuredFlier) return
+    if (navigator.share) {
       try {
-        await navigator.share({ title: 'Fruitbearers Church', text: 'Join us this Sunday! 🌿', url: window.location.origin })
+        await navigator.share({
+          title: 'Fruitbearers Church — Join Us This Sunday! 🌿',
+          text: 'Come worship with us this Sunday! 🙌',
+          url: featuredFlier,
+        })
       } catch (_) {}
     } else {
-      navigator.clipboard?.writeText(window.location.origin)
+      navigator.clipboard?.writeText(featuredFlier)
+      alert('Flier link copied to clipboard!')
     }
   }
 
@@ -268,38 +288,43 @@ export default function HomeScreen() {
       </div>
 
       {/* ═══════════════════════════════════════════════
-          FEATURED FLIER (admin-controlled)
+          FEATURED FLIER (admin uploads, members see live)
           ═══════════════════════════════════════════════ */}
       <div style={{ padding: '0 16px 12px' }}>
         <div style={{ borderRadius: '20px', overflow: 'hidden', position: 'relative', background: '#1a1a1a', border: '1px solid #252525' }}>
           {featuredFlier ? (
             <img src={featuredFlier} alt="This Sunday" style={{ width: '100%', display: 'block', objectFit: 'cover' }} />
           ) : (
-            // Placeholder when no flier is set by admin
+            // Clean placeholder — no preloaded fliers
             <div style={{
               aspectRatio: '1/1', display: 'flex', flexDirection: 'column',
               alignItems: 'center', justifyContent: 'center',
-              background: 'linear-gradient(135deg, #0d1f0e 0%, #1a3a1c 100%)',
-              gap: '12px'
+              background: 'linear-gradient(135deg, #0d1f0e 0%, #1a2e10 100%)',
+              gap: '16px', padding: '32px',
             }}>
-              <img src="/logo.png" alt="" style={{ width: '60px', objectFit: 'contain', filter: 'brightness(0) invert(0.5)' }} />
-              <p style={{ color: '#333', fontSize: '13px', fontWeight: 600 }}>Featured flier coming soon</p>
+              <img src="/logo.png" alt="" style={{ width: '52px', objectFit: 'contain', opacity: 0.2 }} />
+              <div style={{ textAlign: 'center' }}>
+                <p style={{ color: '#333', fontSize: '14px', fontWeight: 700, margin: '0 0 6px' }}>No flier this week yet</p>
+                <p style={{ color: '#2a2a2a', fontSize: '12px', margin: 0 }}>Come back closer to Sunday service!</p>
+              </div>
             </div>
           )}
         </div>
 
-        {/* Share flier button */}
-        <button
-          onClick={shareFlier}
-          style={{
-            width: '100%', marginTop: '10px', padding: '14px',
-            background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
-            borderRadius: '100px', color: '#fff', fontSize: '14px', fontWeight: 600,
-            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
-          }}
-        >
-          <Share2 size={16} /> Share flier! Invite a friend
-        </button>
+        {/* Share flier button — only shown when flier exists */}
+        {featuredFlier && (
+          <button
+            onClick={shareFlier}
+            style={{
+              width: '100%', marginTop: '10px', padding: '14px',
+              background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)',
+              borderRadius: '100px', color: '#fff', fontSize: '14px', fontWeight: 600,
+              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+            }}
+          >
+            <Share2 size={16} /> Share flier! Invite a friend
+          </button>
+        )}
       </div>
 
       {/* ═══════════════════════════════════════════════
@@ -446,20 +471,23 @@ export default function HomeScreen() {
                     <h3 style={{ color: '#fff', fontSize: '18px', fontWeight: 700, margin: 0 }}>Enter Code</h3>
                     <div style={{ width: '32px' }} />
                   </div>
-                  <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', marginBottom: '12px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
                     <input 
                       autoFocus
                       type="number"
                       maxLength={4}
                       value={pin}
                       placeholder="0000"
-                      onChange={e => {
-                        const val = e.target.value.slice(0, 4)
-                        setPin(val)
-                        if (val.length === 4) handleCheckInWithPin(val)
-                      }}
-                      style={{ width: '120px', letterSpacing: '10px', textAlign: 'center', fontSize: '24px', fontWeight: 800, background: '#070d07', border: '2px solid #2a2a2a', borderRadius: '12px', padding: '12px', color: '#fff', outline: 'none' }}
+                      onChange={e => setPin(e.target.value.slice(0, 4))}
+                      style={{ width: '140px', letterSpacing: '12px', textAlign: 'center', fontSize: '28px', fontWeight: 900, background: '#070d07', border: '2px solid #2C5F2D', borderRadius: '14px', padding: '14px', color: '#fff', outline: 'none', boxShadow: 'inset 0 4px 10px rgba(0,0,0,0.5)' }}
                     />
+                    <button
+                      onClick={() => handleCheckInWithPin(pin)}
+                      disabled={pin.length !== 4 || checkingPin}
+                      style={{ width: '100%', padding: '14px', borderRadius: '100px', background: pin.length === 4 ? '#2C5F2D' : '#1a1a1a', color: pin.length === 4 ? '#fff' : '#555', fontWeight: 800, fontSize: '15px', border: 'none', cursor: pin.length === 4 ? 'pointer' : 'not-allowed', transition: 'all 0.2s', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: pin.length === 4 ? '0 4px 15px rgba(44,95,45,0.3)' : 'none' }}
+                    >
+                      {checkingPin ? 'Verifying...' : 'Confirm Check-in'}
+                    </button>
                   </div>
                   {checkInError && <p style={{ color: '#ef4444', fontSize: '12px', textAlign: 'center', marginBottom: '16px' }}>{checkInError}</p>}
                   <p style={{ color: '#444', fontSize: '12px', textAlign: 'center', marginBottom: '24px' }}>Ask the production team for today's PIN</p>

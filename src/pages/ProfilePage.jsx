@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { User, Mail, Save, ArrowLeft, Home, Calendar, Phone, Camera, Loader2, ChevronLeft } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
@@ -10,7 +10,7 @@ import toast from 'react-hot-toast'
  * Dark-themed, high-contrast, designed for mobile-first PWA.
  */
 export default function ProfilePage() {
-  const { profile, fetchProfile } = useAuth()
+  const { user, profile, fetchProfile } = useAuth()
   const navigate = useNavigate()
   
   const [loading, setLoading]       = useState(false)
@@ -24,29 +24,55 @@ export default function ProfilePage() {
     avatar_url: profile?.avatar_url || ''
   })
 
+  // Sync state if profile loads late
+  useEffect(() => {
+    if (profile) {
+      setFormData({
+        full_name: profile.full_name || '',
+        wisdom_house: profile.wisdom_house || '',
+        dob: profile.dob || '',
+        phone: profile.phone || '',
+        avatar_url: profile.avatar_url || ''
+      })
+    }
+  }, [profile])
+
   const handleChange = (e) => {
     setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }))
   }
 
   const handleUpdate = async (e) => {
     e.preventDefault()
+    
+    // Use user.id as the source of truth for the ID
+    const targetId = profile?.id || user?.id
+    
+    if (!targetId) {
+      toast.error('Authentication Error: Please log in again.')
+      return
+    }
+
     setLoading(true)
 
+    // UPSERT instead of UPDATE: This repairs the profile if the trigger failed
     const { error } = await supabase
       .from('profiles')
-      .update({ 
+      .upsert({ 
+        id: targetId,
         full_name: formData.full_name,
         wisdom_house: formData.wisdom_house,
         dob: formData.dob || null,
         phone: formData.phone,
-        avatar_url: formData.avatar_url
-      })
-      .eq('id', profile.id)
+        avatar_url: formData.avatar_url,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' })
 
     if (error) {
-      toast.error('Failed to update profile')
+      console.error('Update profile error:', error)
+      toast.error(`Update failed: ${error.message || error.code || 'Unspecified error'}`)
     } else {
-      await fetchProfile(profile.id)
+      // Refresh the global profile state
+      await fetchProfile(targetId)
       toast.success('Your information has been updated!')
       setTimeout(() => navigate('/home'), 1500)
     }
@@ -57,15 +83,21 @@ export default function ProfilePage() {
     const file = e.target.files[0]
     if (!file) return
 
+    const targetId = profile?.id || user?.id
+    if (!targetId) {
+      toast.error('Please log in properly before uploading')
+      return
+    }
+
     setUploading(true)
     const fileExt = file.name.split('.').pop()
-    const fileName = `${profile.id}-${Date.now()}.${fileExt}`
+    const fileName = `${targetId}-${Date.now()}.${fileExt}`
     const filePath = `avatars/${fileName}`
 
     try {
       // 1. Upload to storage
       const { error: uploadErr } = await supabase.storage
-        .from('avatars') // Make sure this bucket exists in Supabase storage
+        .from('avatars') 
         .upload(filePath, file)
 
       if (uploadErr) throw uploadErr
@@ -149,7 +181,7 @@ export default function ProfilePage() {
             </InputGroup>
 
             <InputGroup label="Email ID" icon={<Mail size={18} />} readOnly>
-              <input type="text" className="profile-input" value={profile?.email || ''} readOnly style={{ opacity: 0.5 }} />
+              <input type="text" className="profile-input" value={profile?.email || user?.email || ''} readOnly style={{ opacity: 0.5 }} />
             </InputGroup>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
