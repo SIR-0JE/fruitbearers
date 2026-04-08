@@ -308,28 +308,70 @@ function HomePageTab() {
   const [saved, setSaved]         = useState(false)
   const fileInputRef              = useRef(null)
 
+  // New States for Preview and CTA
+  const [selectedFile, setSelectedFile] = useState(null)
+  const [previewUrl, setPreviewUrl]     = useState('')
+
   useEffect(() => {
     supabase.from('app_settings').select('value').eq('key', 'featured_flier_url').single()
       .then(({ data }) => data && setCurrent(data.value))
   }, [])
 
-  const uploadFlier = async (e) => {
+  const handleFileSelect = (e) => {
     const file = e.target.files?.[0]
     if (!file) return
+    setSelectedFile(file)
+    setPreviewUrl(URL.createObjectURL(file))
+  }
+
+  // Optimize large phone pictures before uploading
+  const compressImage = (file) => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        // Cap width at 1200px to maintain quality while massively shrinking file size
+        const scaleSize = img.width > 1200 ? 1200 / img.width : 1;
+        canvas.width = img.width * scaleSize;
+        canvas.height = img.height * scaleSize;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob((blob) => {
+          resolve(new File([blob], file.name.replace(/\.[^/.]+$/, ".jpg"), { type: 'image/jpeg', lastModified: Date.now() }));
+        }, 'image/jpeg', 0.8); // 80% quality JPEG
+      };
+    });
+  }
+
+  const confirmUpload = async () => {
+    if (!selectedFile) return
     setUploading(true)
 
-    const ext  = file.name.split('.').pop()
-    const path = `fliers/sunday-flier-${Date.now()}.${ext}`
+    try {
+      // Compress the image before uploading to fix "slow/failing" issues on phones
+      const optimizedFile = await compressImage(selectedFile)
+      
+      const path = `fliers/sunday-flier-${Date.now()}.jpg`
 
-    const { error: upErr } = await supabase.storage.from('media').upload(path, file, { upsert: true })
-    if (upErr) { alert('Upload failed: ' + upErr.message); setUploading(false); return }
+      const { error: upErr } = await supabase.storage.from('media').upload(path, optimizedFile, { upsert: true })
+      if (upErr) throw upErr
 
-    const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(path)
+      const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(path)
 
-    await supabase.from('app_settings').upsert({ key: 'featured_flier_url', value: publicUrl })
-    setCurrent(publicUrl)
-    setSaved(true); setUploading(false)
-    setTimeout(() => setSaved(false), 3000)
+      await supabase.from('app_settings').upsert({ key: 'featured_flier_url', value: publicUrl })
+      setCurrent(publicUrl)
+      setSaved(true)
+      setSelectedFile(null)
+      setPreviewUrl('')
+      // clear the actual input so the same file could be chosen again
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      setTimeout(() => setSaved(false), 3000)
+    } catch (err) {
+      alert('Upload failed: ' + err.message)
+    } finally {
+      setUploading(false)
+    }
   }
 
   return (
@@ -357,17 +399,38 @@ function HomePageTab() {
           <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '12px' }}>Upload This Week's Flier</p>
 
           {/* Hidden real file input */}
-          <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={uploadFlier} />
+          <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleFileSelect} />
 
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            style={{ width: '100%', padding: '48px 24px', borderRadius: '20px', border: '2px dashed rgba(44,95,45,0.4)', background: '#070d07', color: '#2C5F2D', fontWeight: 700, fontSize: '15px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', transition: 'all 0.2s' }}
-          >
-            <span style={{ fontSize: '36px' }}>{uploading ? '⏳' : '📤'}</span>
-            {uploading ? 'Uploading...' : 'Click to upload flier'}
-            <span style={{ color: '#555', fontSize: '12px', fontWeight: 500 }}>PNG or JPG · Replaces current flier immediately</span>
-          </button>
+          {!selectedFile ? (
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              style={{ width: '100%', padding: '48px 24px', borderRadius: '20px', border: '2px dashed rgba(44,95,45,0.4)', background: '#070d07', color: '#2C5F2D', fontWeight: 700, fontSize: '15px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', transition: 'all 0.2s' }}
+            >
+              <span style={{ fontSize: '36px' }}>📤</span>
+              Click to select flier
+              <span style={{ color: '#555', fontSize: '12px', fontWeight: 500 }}>PNG or JPG · Compresses automatically</span>
+            </button>
+          ) : (
+            <div style={{ background: '#070d07', border: '1px solid #2C5F2D', borderRadius: '20px', padding: '16px' }}>
+              <div style={{ position: 'relative', width: '100%', background: '#000', aspectRatio: '1/1', borderRadius: '12px', overflow: 'hidden', marginBottom: '16px' }}>
+                <img src={previewUrl} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                <button 
+                  onClick={() => { setSelectedFile(null); setPreviewUrl(''); if (fileInputRef.current) fileInputRef.current.value = '' }} 
+                  disabled={uploading} 
+                  style={{ position: 'absolute', top: '10px', right: '10px', background: 'rgba(0,0,0,0.6)', border: 'none', color: '#fff', width: '32px', height: '32px', borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <button 
+                onClick={confirmUpload}
+                disabled={uploading}
+                style={{ width: '100%', background: '#2C5F2D', color: '#fff', border: 'none', padding: '16px', borderRadius: '12px', fontWeight: 800, fontSize: '15px', cursor: uploading ? 'not-allowed' : 'pointer', display: 'flex', justifyContent: 'center', gap: '8px', transition: 'all 0.2s' }}
+              >
+                 {uploading ? '⏳ Optimizing & Uploading...' : 'Confirm & Publish Flier'}
+              </button>
+            </div>
+          )}
 
           <div style={{ marginTop: '20px', padding: '16px', background: '#0d160d', borderRadius: '14px', border: '1px solid rgba(44,95,45,0.15)' }}>
             <p style={{ color: '#2C5F2D', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 8px' }}>How it works</p>
