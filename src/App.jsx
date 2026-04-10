@@ -14,6 +14,7 @@ import AdminDashboard from './pages/AdminDashboard'
 import CheckInPage from './pages/CheckInPage'
 import HomeScreen from './pages/HomeScreen'
 import MediaScreen from './pages/MediaScreen'
+import TopicsScreen from './pages/TopicsScreen'
 import GivingScreen from './pages/GivingScreen'
 import AccountScreen from './pages/AccountScreen'
 import ScannerPage from './pages/ScannerPage'
@@ -51,6 +52,7 @@ export default function App() {
               <Route element={<ProtectedRoute />}>
                 <Route path="/home"          element={<HomeScreen />} />
                 <Route path="/media"         element={<MediaScreen />} />
+                <Route path="/topics"        element={<TopicsScreen />} />
                 <Route path="/giving"        element={<GivingScreen />} />
                 <Route path="/account"       element={<AccountScreen />} />
                 <Route path="/profile"       element={<ProfilePage />} />

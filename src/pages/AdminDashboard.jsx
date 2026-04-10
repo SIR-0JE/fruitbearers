@@ -3,12 +3,13 @@ import { supabase } from '../lib/supabase'
 import { useAuth } from '../contexts/AuthContext'
 import { useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
+import * as tus from 'tus-js-client'
 import {
   LayoutDashboard, Users, Calendar, Tv2, Image as ImageIcon,
   LogOut, Bell, Mail, CheckCircle, XCircle, Edit3, X,
   ChevronRight, TrendingUp, RefreshCw, Eye, Trash2,
   Heart, DollarSign, Upload, Copy, ExternalLink, QrCode, Plus, Search, Filter, 
-  MessageCircle, PhoneOutgoing, Gift, Megaphone, Send, Landmark
+  MessageCircle, PhoneOutgoing, Gift, Megaphone, Send, Landmark, BookOpen
 } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 
@@ -21,6 +22,7 @@ const NAV = [
   { id: 'birthday',   icon: Gift,             label: 'Birthdays'  },
   { id: 'broadcast',  icon: Megaphone,        label: 'Broadcast'  },
   { id: 'giving',     icon: DollarSign,       label: 'Giving'     },
+  { id: 'themes',     icon: BookOpen,         label: 'Curriculum'    },
 ]
 
 export default function AdminDashboard() {
@@ -28,6 +30,9 @@ export default function AdminDashboard() {
   const navigate = useNavigate()
   const [active, setActive] = useState('overview')
   const [stats, setStats] = useState({ members: 0, checkins: 0, sermons: 0, giving: 0 })
+  
+  // ── Global Background Uploader State
+  const [bgUpload, setBgUpload] = useState({ active: false, progress: 0, text: '', filename: '', error: null, success: false })
 
   useEffect(() => {
     loadStats()
@@ -53,6 +58,75 @@ export default function AdminDashboard() {
   }
 
   const handleSignOut = async () => { await signOut(); navigate('/admin-portal') }
+
+  const startBackgroundUpload = async (form, audioFile, thumbFile) => {
+    setBgUpload({ active: true, progress: 0, text: 'Initializing...', filename: audioFile.name, error: null, success: false })
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      
+      setBgUpload(p => ({ ...p, text: 'Uploading thumbnail...' }))
+      let thumbUrl = ''
+      if (thumbFile) {
+        const thumbExt = thumbFile.name.split('.').pop()
+        const thumbPath = `thumbnails/${Date.now()}-${Math.random().toString(36).slice(2)}.${thumbExt}`
+        const { error: tErr } = await supabase.storage.from('media').upload(thumbPath, thumbFile)
+        if (tErr) throw tErr
+        thumbUrl = supabase.storage.from('media').getPublicUrl(thumbPath).data.publicUrl
+      }
+
+      setBgUpload(p => ({ ...p, text: 'Starting audio upload...' }))
+      
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+      const tusEndpoint = `${supabaseUrl}/storage/v1/upload/resumable`
+      const audioExt = audioFile.name.split('.').pop()
+      const audioPath = `sermons/${Date.now()}-${Math.random().toString(36).slice(2)}.${audioExt}`
+
+      const upload = new tus.Upload(audioFile, {
+        endpoint: tusEndpoint,
+        retryDelays: [0, 3000, 5000, 10000, 20000],
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+          'x-upsert': 'true',
+        },
+        uploadDataDuringCreation: true,
+        removeFingerprintOnSuccess: true,
+        metadata: {
+          bucketName: 'media',
+          objectName: audioPath,
+          contentType: audioFile.type || 'audio/mpeg',
+          cacheControl: '3600',
+        },
+        chunkSize: 6 * 1024 * 1024,
+        onError: (error) => {
+          console.error("TUS Error:", error)
+          setBgUpload(p => ({ ...p, error: 'Upload failed: ' + error.message }))
+        },
+        onProgress: (bytesUploaded, bytesTotal) => {
+          const percentage = ((bytesUploaded / bytesTotal) * 100).toFixed(0)
+          setBgUpload(p => ({ ...p, progress: Number(percentage), text: `Uploading chunks: ${percentage}%` }))
+        },
+        onSuccess: async () => {
+          setBgUpload(p => ({ ...p, text: 'Finalizing database...', progress: 100 }))
+          const audioUrl = supabase.storage.from('media').getPublicUrl(audioPath).data.publicUrl
+          const { error: dbErr } = await supabase.from('sermons').insert({ ...form, thumbnail_url: thumbUrl, audio_url: audioUrl })
+          
+          if (dbErr) setBgUpload(p => ({ ...p, error: 'DB Save failed: ' + dbErr.message }))
+          else {
+            setBgUpload(p => ({ ...p, text: 'Upload Successful! 🎉', success: true }))
+            setTimeout(() => setBgUpload({ active: false, progress: 0, text: '', filename: '', error: null, success: false }), 5000)
+          }
+        }
+      })
+      upload.findPreviousUploads().then((prev) => {
+        if (prev.length) upload.resumeFromPreviousUpload(prev[0])
+        upload.start()
+      })
+    } catch (e) {
+      setBgUpload(p => ({ ...p, error: e.message }))
+    }
+  }
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#070d07', fontFamily: "'DM Sans', sans-serif", color: '#fff' }}>
@@ -144,12 +218,45 @@ export default function AdminDashboard() {
           {active === 'home'       && <HomePageTab   key="hp" />}
           {active === 'attendance' && <AttendanceTab key="at" />}
           {active === 'members'    && <MembersTab    key="mb" />}
-          {active === 'media'      && <MediaTab      key="md" />}
+          {active === 'media'      && <MediaTab      key="md" onStartUpload={startBackgroundUpload} />}
           {active === 'birthday'   && <BirthdayTab   key="bd" />}
           {active === 'broadcast'  && <CommunicationTab key="bc" />}
           {active === 'giving'     && <GivingTab     key="gv" />}
+          {active === 'themes'     && <ThemesTab     key="th" />}
         </AnimatePresence>
       </main>
+
+      {/* Global Background Uploader Tracking Widget */}
+      <AnimatePresence>
+        {bgUpload.active && (
+          <motion.div initial={{ opacity: 0, y: 50, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 50, scale: 0.9 }}
+            style={{ position: 'fixed', bottom: '24px', right: '24px', zIndex: 9999, background: '#0d160d', border: `1px solid ${bgUpload.error ? 'rgba(239,68,68,0.5)' : bgUpload.success ? 'rgba(44,95,45,0.5)' : 'rgba(255,255,255,0.1)'}`, borderRadius: '16px', padding: '16px 20px', width: '340px', boxShadow: '0 20px 40px rgba(0,0,0,0.8)', display: 'flex', flexDirection: 'column', gap: '8px' }}
+          >
+             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+               <div style={{ flex: 1, overflow: 'hidden' }}>
+                 <p style={{ color: bgUpload.error ? '#ef4444' : bgUpload.success ? '#2C5F2D' : '#d4af37', fontSize: '11px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 4px' }}>
+                   {bgUpload.error ? 'Upload Failed' : bgUpload.success ? 'Complete' : 'Background Upload'}
+                 </p>
+                 <p style={{ color: '#fff', fontSize: '13px', fontWeight: 600, margin: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{bgUpload.filename}</p>
+               </div>
+               {(bgUpload.error || bgUpload.success) && (
+                 <button onClick={() => setBgUpload({ active: false })} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#555', borderRadius: '50%', width: '28px', height: '28px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><X size={14}/></button>
+               )}
+             </div>
+
+             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px' }}>
+               <p style={{ color: '#aaa', fontSize: '12px', margin: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', paddingRight: '8px' }}>{bgUpload.error || bgUpload.text}</p>
+               {(!bgUpload.error && !bgUpload.success) && <p style={{ color: '#fff', fontSize: '12px', fontWeight: 700, margin: 0 }}>{bgUpload.progress}%</p>}
+             </div>
+             
+             {(!bgUpload.error && !bgUpload.success) && (
+               <div style={{ width: '100%', height: '6px', background: '#1a2e1a', borderRadius: '100px', overflow: 'hidden', marginTop: '4px' }}>
+                 <div style={{ height: '100%', background: '#2C5F2D', width: `${bgUpload.progress}%`, transition: 'width 0.3s ease' }} />
+               </div>
+             )}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
@@ -796,6 +903,7 @@ function MembersTab() {
   const [members, setMembers] = useState([])
   const [search, setSearch]   = useState('')
   const [loading, setLoading] = useState(true)
+  const [selectedMember, setSelectedMember] = useState(null)
 
   const loadMembers = () => {
     supabase.from('profiles').select('*').order('created_at', { ascending: false })
@@ -813,17 +921,16 @@ function MembersTab() {
     return () => supabase.removeChannel(channel)
   }, [])
 
-  const filtered = members.filter(m =>
-    m.full_name?.toLowerCase().includes(search.toLowerCase()) ||
-    m.email?.toLowerCase().includes(search.toLowerCase()) ||
-    m.campus?.toLowerCase().includes(search.toLowerCase())
-  )
+  const filtered = members.filter(m => {
+    const term = search.toLowerCase()
+    const nameMatch = m.full_name?.toLowerCase().includes(term)
+    const emailMatch = m.email?.toLowerCase().includes(term)
+    const houseMatch = m.wisdom_house?.toLowerCase().includes(term)
+    const dobMatch = m.dob && new Date(m.dob).toLocaleString('default', { month: 'long' }).toLowerCase().includes(term)
+    return nameMatch || emailMatch || houseMatch || dobMatch
+  })
 
-  const toggleRole = async (m) => {
-    const newRole = m.role === 'admin' ? 'member' : 'admin'
-    await supabase.from('profiles').update({ role: newRole }).eq('id', m.id)
-    setMembers(prev => prev.map(p => p.id === m.id ? { ...p, role: newRole } : p))
-  }
+  // Role toggling is now handled inside UserProfileModal
 
   return (
     <PageWrap title="Members" subtitle={`${members.filter(m => m.role === 'member').length} registered members`}>
@@ -831,7 +938,7 @@ function MembersTab() {
         <input
           value={search}
           onChange={e => setSearch(e.target.value)}
-          placeholder="Search by name, email, or campus..."
+          placeholder="Filter by name, email, wisdom house, or birth month..."
           style={{ width: '100%', maxWidth: '400px', background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '11px 16px', color: '#fff', fontSize: '14px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }}
         />
       </div>
@@ -841,58 +948,47 @@ function MembersTab() {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid rgba(44,95,45,0.15)' }}>
-              {['Member', 'Email', 'Campus', 'Streak', 'Role', 'Actions'].map(h => (
+              {['Member', 'Email', 'Date of Birth', 'House'].map(h => (
                 <th key={h} style={{ padding: '14px 20px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', textAlign: 'left' }}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={6} style={{ padding: '40px', textAlign: 'center', color: '#444' }}>Loading...</td></tr>
+              <tr><td colSpan={4} style={{ padding: '40px', textAlign: 'center', color: '#444' }}>Loading...</td></tr>
             ) : filtered.map(m => (
-              <tr key={m.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+              <tr key={m.id} onClick={() => setSelectedMember(m)} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)', cursor: 'pointer', transition: 'background 0.2s' }} onMouseOver={e => e.currentTarget.style.background='rgba(44,95,45,0.1)'} onMouseOut={e => e.currentTarget.style.background='transparent'}>
                 <td style={{ padding: '14px 20px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: '#1a2e1a', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                      <span style={{ color: '#2C5F2D', fontSize: '12px', fontWeight: 700 }}>{m.full_name?.charAt(0)}</span>
+                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: m.avatar_url ? 'transparent' : '#1a2e1a', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      {m.avatar_url ? <img src={m.avatar_url} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ color: '#2C5F2D', fontSize: '12px', fontWeight: 700 }}>{m.full_name?.charAt(0)}</span>}
                     </div>
                     <span style={{ color: '#fff', fontSize: '13px', fontWeight: 600 }}>{m.full_name}</span>
                   </div>
                 </td>
                 <td style={{ padding: '14px 20px', color: '#666', fontSize: '13px' }}>{m.email}</td>
-                <td style={{ padding: '14px 20px', color: '#888', fontSize: '13px' }}>{m.campus || '—'}</td>
+                <td style={{ padding: '14px 20px', color: '#888', fontSize: '13px' }}>{m.dob ? new Date(m.dob).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'}</td>
                 <td style={{ padding: '14px 20px' }}>
-                  <span style={{ color: '#d4af37', fontSize: '13px', fontWeight: 700 }}>🔥 {m.attendance_streak || 0}</span>
-                </td>
-                <td style={{ padding: '14px 20px' }}>
-                  <span style={{
-                    padding: '3px 10px', borderRadius: '100px', fontSize: '11px', fontWeight: 700,
-                    background: m.role === 'admin' ? 'rgba(44,95,45,0.2)' : 'rgba(255,255,255,0.05)',
-                    color: m.role === 'admin' ? '#2C5F2D' : '#555',
-                    border: `1px solid ${m.role === 'admin' ? 'rgba(44,95,45,0.3)' : 'rgba(255,255,255,0.08)'}`,
-                  }}>{m.role}</span>
-                </td>
-                <td style={{ padding: '14px 20px' }}>
-                  <button
-                    onClick={() => toggleRole(m)}
-                    style={{ padding: '5px 12px', borderRadius: '8px', background: '#1a1a1a', border: '1px solid #2a2a2a', color: '#aaa', fontSize: '11px', fontWeight: 700, cursor: 'pointer' }}
-                  >
-                    {m.role === 'admin' ? 'Make Member' : 'Make Admin'}
-                  </button>
+                  <span style={{ color: '#d4af37', fontSize: '13px', fontWeight: 700 }}>{m.wisdom_house || '—'}</span>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+
+      <AnimatePresence>
+        {selectedMember && <UserProfileModal member={selectedMember} onClose={() => setSelectedMember(null)} />}
+      </AnimatePresence>
     </PageWrap>
   )
 }
 
+
 // ════════════════════════════════════
 // MEDIA TAB
 // ════════════════════════════════════
-function MediaTab() {
+function MediaTab({ onStartUpload }) {
   const [sermons, setSermons]   = useState([])
   const [photos, setPhotos]     = useState([])
   const [loading, setLoading]   = useState(true)
@@ -941,22 +1037,29 @@ function MediaTab() {
 
   const saveSermon = async () => {
     if (!form.title) return
-    setSaving(true)
-    try {
-      setProgress('Uploading thumbnail...')
-      const thumbUrl = thumbFile ? await uploadFile(thumbFile, 'media', 'thumbnails') : ''
-      setProgress('Uploading audio...')
-      const audioUrl = audioFile ? await uploadFile(audioFile, 'media', 'sermons') : ''
-      setProgress('Saving...')
-      await supabase.from('sermons').insert({ ...form, thumbnail_url: thumbUrl, audio_url: audioUrl })
+
+    if (audioFile) {
+      // 🚀 Pass off massive audio files into the background tracker instantly
+      if (onStartUpload) onStartUpload(form, audioFile, thumbFile)
       setShowAdd(false)
       setForm({ title: '', series: '', speaker: '', date: new Date().toISOString().split('T')[0], duration: '' })
       setThumbFile(null); setAudioFile(null)
-      load()
-    } catch (e) {
-      alert('Upload error: ' + e.message)
+    } else {
+      // Small/No-audio save
+      setSaving(true)
+      try {
+        setProgress('Uploading thumbnail...')
+        const thumbUrl = thumbFile ? await uploadFile(thumbFile, 'media', 'thumbnails') : ''
+        setProgress('Saving...')
+        await supabase.from('sermons').insert({ ...form, thumbnail_url: thumbUrl, audio_url: '' })
+        setShowAdd(false)
+        setForm({ title: '', series: '', speaker: '', date: new Date().toISOString().split('T')[0], duration: '' })
+        setThumbFile(null); setAudioFile(null)
+      } catch (e) {
+        alert('Upload error: ' + e.message)
+      }
+      setSaving(false); setProgress('')
     }
-    setSaving(false); setProgress('')
   }
 
   const savePhotos = async () => {
@@ -1058,14 +1161,14 @@ function MediaTab() {
       {/* Add Media Modal */}
       <AnimatePresence>
         {showAdd && (
-          <>
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { if (!saving) setShowAdd(false) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', zIndex: 200 }} />
-            <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }}
-              style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 201, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '28px', width: 'min(500px, calc(100vw - 40px))', maxHeight: '90vh', overflowY: 'auto' }}
+          <div style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => { if (!saving) setShowAdd(false) }} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(8px)' }} />
+            <motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              style={{ position: 'relative', zIndex: 201, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '28px', width: 'min(500px, 100%)', maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
                 <h3 style={{ color: '#fff', fontWeight: 800, margin: 0, fontSize: '18px' }}>Add Media</h3>
-                <button onClick={() => { if (!saving) setShowAdd(false) }} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer' }}><X size={20} /></button>
+                <button onClick={() => { if (!saving) setShowAdd(false) }} style={{ background: 'rgba(255,255,255,0.05)', borderRadius: '50%', width: '32px', height: '32px', border: 'none', color: '#555', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyItems: 'center', padding: '7px' }}><X size={18} /></button>
               </div>
 
               {/* Type Selector */}
@@ -1152,7 +1255,7 @@ function MediaTab() {
                 </>
               )}
             </motion.div>
-          </>
+          </div>
         )}
       </AnimatePresence>
     </PageWrap>
@@ -1257,7 +1360,20 @@ function EmailModal({ member, date, onClose }) {
 }
 
 // ── User Profile Detail Modal ────────────────────────────
-function UserProfileModal({ member, onClose }) {
+function UserProfileModal({ member: initialMember, onClose }) {
+  const [member, setMember] = useState(initialMember)
+
+  const toggleRole = async () => {
+    if (!confirm(`Are you sure you want to change ${member.full_name}'s role?`)) return
+    const newRole = member.role === 'admin' ? 'member' : 'admin'
+    const { error } = await supabase.from('profiles').update({ role: newRole }).eq('id', member.id)
+    if (!error) {
+      setMember(prev => ({ ...prev, role: newRole }))
+    } else {
+      alert('Failed to update role: ' + error.message)
+    }
+  }
+
   const downloadAvatar = async () => {
     if (!member.avatar_url) return;
     try {
@@ -1289,7 +1405,13 @@ function UserProfileModal({ member, onClose }) {
       <motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 20 }}
         style={{ position: 'relative', zIndex: 401, background: '#0d160d', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '32px', width: 'min(400px, 100%)', boxShadow: '0 30px 60px -15px rgba(0,0,0,0.8)' }}
       >
-        <div style={{ position: 'absolute', top: '24px', right: '24px' }}>
+        <div style={{ position: 'absolute', top: '24px', right: '24px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <button 
+             onClick={toggleRole}
+             style={{ padding: '6px 12px', borderRadius: '8px', background: member.role === 'admin' ? 'rgba(239,68,68,0.1)' : 'rgba(44,95,45,0.2)', border: `1px solid ${member.role === 'admin' ? 'rgba(239,68,68,0.3)' : 'rgba(44,95,45,0.3)'}`, color: member.role === 'admin' ? '#ef4444' : '#2C5F2D', fontSize: '11px', fontWeight: 800, cursor: 'pointer', transition: 'all 0.2s' }}
+          >
+             {member.role === 'admin' ? 'Demote from Admin' : 'Make Admin'}
+          </button>
           <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#555', borderRadius: '50%', width: '32px', height: '32px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><X size={16} /></button>
         </div>
 
@@ -1454,3 +1576,301 @@ function CommunicationTab() {
   )
 }
 
+// ════════════════════════════════════
+// THEMES TAB (Curriculum Manager)
+// ════════════════════════════════════
+function ThemesTab() {
+  const [themes, setThemes] = useState([])
+  const [coaches, setCoaches] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  // Modals
+  const [showThemeModal, setShowThemeModal] = useState(false)
+  const [showModModal, setShowModModal] = useState(false)
+  const [showTopicModal, setShowTopicModal] = useState(false)
+  const [showCoachModal, setShowCoachModal] = useState(false)
+
+  // Forms
+  const [themeForm, setThemeForm] = useState({ id: null, name: '' })
+  const [modForm, setModForm] = useState({ id: null, theme_id: null, title: '', order_number: 0 })
+  const [topicForm, setTopicForm] = useState({ id: null, module_id: null, title: '', order_number: 0 })
+  const [coachForm, setCoachForm] = useState({ id: null, name: '' })
+
+  // Expand toggles
+  const [expandedTheme, setExpandedTheme] = useState(null)
+  const [expandedMod, setExpandedMod] = useState(null)
+
+  const load = async () => {
+    setLoading(true)
+    const { data: qCoaches } = await supabase.from('coaches').select('*').order('name', { ascending: true })
+    if (qCoaches) setCoaches(qCoaches)
+
+    const { data: qThemes } = await supabase
+      .from('themes')
+      .select(`*, modules(*, topics(*))`)
+      .order('created_at', { ascending: false })
+
+    if (qThemes) {
+      qThemes.forEach(t => {
+        t.modules?.sort((a,b) => a.order_number - b.order_number)
+        t.modules?.forEach(m => m.topics?.sort((a,b) => a.order_number - b.order_number))
+      })
+      setThemes(qThemes)
+      // Auto-expand the first theme
+      if (qThemes.length > 0 && !expandedTheme) setExpandedTheme(qThemes[0].id)
+    }
+    setLoading(false)
+  }
+
+  useEffect(() => { load() }, [])
+
+  // --- Theme CRUD ---
+  const saveTheme = async () => {
+    if (!themeForm.name) return
+    if (themeForm.id) {
+      await supabase.from('themes').update({ name: themeForm.name }).eq('id', themeForm.id)
+    } else {
+      await supabase.from('themes').insert({ name: themeForm.name })
+    }
+    setShowThemeModal(false)
+    load()
+  }
+  const deleteTheme = async (id) => {
+    if (!confirm('Delete this entire Theme and ALL its modules and topics?')) return
+    await supabase.from('themes').delete().eq('id', id)
+    load()
+  }
+
+  // --- Module CRUD ---
+  const saveModule = async () => {
+    if (!modForm.title || !modForm.theme_id) return
+    if (modForm.id) {
+      await supabase.from('modules').update({ title: modForm.title, order_number: modForm.order_number }).eq('id', modForm.id)
+    } else {
+      await supabase.from('modules').insert({ theme_id: modForm.theme_id, title: modForm.title, order_number: modForm.order_number })
+    }
+    setShowModModal(false)
+    load()
+  }
+  const deleteModule = async (id) => {
+    if (!confirm('Delete this module and ALL its topics?')) return
+    await supabase.from('modules').delete().eq('id', id)
+    load()
+  }
+
+  // --- Topic CRUD ---
+  const saveTopic = async () => {
+    if (!topicForm.title || !topicForm.module_id) return
+    if (topicForm.id) {
+      await supabase.from('topics').update({ title: topicForm.title, order_number: topicForm.order_number }).eq('id', topicForm.id)
+    } else {
+      await supabase.from('topics').insert({ module_id: topicForm.module_id, title: topicForm.title, order_number: topicForm.order_number })
+    }
+    setShowTopicModal(false)
+    load()
+  }
+
+  // --- Coach CRUD ---
+  const saveCoach = async () => {
+    if (!coachForm.name) return
+    if (coachForm.id) {
+      await supabase.from('coaches').update({ name: coachForm.name }).eq('id', coachForm.id)
+    } else {
+      await supabase.from('coaches').insert({ name: coachForm.name })
+    }
+    setCoachForm({ id: null, name: '' })
+    load()
+  }
+  const deleteCoach = async (id) => {
+    if (!confirm('Delete this coach completely?')) return
+    await supabase.from('coaches').delete().eq('id', id)
+    load()
+  }
+  const deleteTopic = async (id) => {
+    if (!confirm('Delete this topic?')) return
+    await supabase.from('topics').delete().eq('id', id)
+    load()
+  }
+
+  // --- Builders ---
+  const newModuleForTheme = (themeId) => {
+    setModForm({ id: null, theme_id: themeId, title: '', order_number: 0 })
+    setShowModModal(true)
+  }
+  const newTopicForModule = (moduleId) => {
+    setTopicForm({ id: null, module_id: moduleId, title: '', order_number: 0 })
+    setShowTopicModal(true)
+  }
+
+  const inputStyle = { width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }
+  const labelStyle = { display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '6px' }
+
+  return (
+    <PageWrap 
+      title="Curriculum" 
+      subtitle="Manage Themes, Modules, and Topics"
+      action={
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button onClick={() => setShowCoachModal(true)} style={{ padding: '10px 16px', borderRadius: '12px', background: 'transparent', color: '#888', fontWeight: 700, fontSize: '13px', border: '1px solid #333', cursor: 'pointer' }}>
+            Manage Coaches
+          </button>
+          <button onClick={() => { setThemeForm({ id: null, name: '' }); setShowThemeModal(true); }} style={{ display: 'flex', alignItems: 'center', gap: '7px', padding: '10px 16px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '13px', border: 'none', cursor: 'pointer' }}>
+            <Plus size={16} /> New Theme
+          </button>
+        </div>
+      }
+    >
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+        {themes.map(theme => (
+          <div key={theme.id} style={{ background: '#080c08', border: '1px solid rgba(44,95,45,0.4)', borderRadius: '20px', overflow: 'hidden' }}>
+            {/* THEME HEADER */}
+            <div style={{ padding: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0d160d', borderBottom: '1px solid rgba(44,95,45,0.1)' }}>
+              <div style={{ flex: 1, cursor: 'pointer' }} onClick={() => setExpandedTheme(expandedTheme === theme.id ? null : theme.id)}>
+                <p style={{ color: '#4ade80', fontSize: '11px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>Theme</p>
+                <h2 style={{ color: '#fff', fontSize: '22px', fontWeight: 800, margin: '0 0 6px' }}>{theme.name}</h2>
+                <p style={{ color: '#888', fontSize: '13px', margin: 0 }}>{theme.modules?.length || 0} Modules</p>
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button onClick={() => { setThemeForm(theme); setShowThemeModal(true) }} style={{ padding: '8px 12px', borderRadius: '8px', background: '#1c1c1c', border: '1px solid #333', color: '#fff', fontSize: '12px', cursor: 'pointer' }}>Edit</button>
+                <button onClick={() => deleteTheme(theme.id)} style={{ padding: '8px 12px', borderRadius: '8px', background: '#2e1a1a', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444', fontSize: '12px', cursor: 'pointer' }}>Delete</button>
+              </div>
+            </div>
+
+            {/* THEME BODY (MODULES) */}
+            {expandedTheme === theme.id && (
+              <div style={{ padding: '20px' }}>
+                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                    <h4 style={{ color: '#888', fontSize: '13px', fontWeight: 800, textTransform: 'uppercase', margin: 0 }}>Modules</h4>
+                    <button onClick={() => newModuleForTheme(theme.id)} style={{ padding: '8px 14px', borderRadius: '8px', background: '#1a2e10', color: '#4ade80', fontSize: '12px', fontWeight: 700, border: '1px solid #2C5F2D', cursor: 'pointer' }}>+ Add Module</button>
+                 </div>
+
+                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                   {theme.modules?.length === 0 ? <p style={{ color: '#555', fontSize: '13px' }}>No modules built yet.</p> : null}
+                   
+                   {theme.modules?.map(mod => (
+                     <div key={mod.id} style={{ background: '#111', border: '1px solid #222', borderRadius: '16px', overflow: 'hidden' }}>
+                        {/* MODULE HEADER */}
+                        <div style={{ padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#151515' }}>
+                           <div style={{ flex: 1, cursor: 'pointer' }} onClick={() => setExpandedMod(expandedMod === mod.id ? null : mod.id)}>
+                              <p style={{ color: '#d4af37', fontSize: '10px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '4px' }}>Mod {mod.order_number}</p>
+                              <h4 style={{ color: '#fff', fontSize: '16px', fontWeight: 700, margin: '0 0 4px' }}>{mod.title}</h4>
+                           </div>
+                           <div style={{ display: 'flex', gap: '8px' }}>
+                             <button onClick={() => { setModForm(mod); setShowModModal(true) }} style={{ padding: '6px 10px', borderRadius: '6px', background: '#222', border: 'none', color: '#fff', fontSize: '11px', cursor: 'pointer' }}>Edit</button>
+                             <button onClick={() => deleteModule(mod.id)} style={{ padding: '6px 10px', borderRadius: '6px', background: 'rgba(239,68,68,0.1)', border: 'none', color: '#ef4444', fontSize: '11px', cursor: 'pointer' }}>Del</button>
+                           </div>
+                        </div>
+
+                        {/* MODULE BODY (TOPICS) */}
+                        {expandedMod === mod.id && (
+                           <div style={{ padding: '16px 20px', borderTop: '1px solid #222' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                 <h5 style={{ color: '#666', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', margin: 0 }}>Topics</h5>
+                                 <button onClick={() => newTopicForModule(mod.id)} style={{ padding: '4px 10px', borderRadius: '6px', background: '#222', color: '#aaa', fontSize: '11px', fontWeight: 700, border: '1px solid #333', cursor: 'pointer' }}>+ Add Topic</button>
+                              </div>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                 {mod.topics?.length === 0 ? <p style={{ color: '#444', fontSize: '12px', margin: 0 }}>No topics yet.</p> : null}
+                                 {mod.topics?.map(topic => (
+                                    <div key={topic.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px', background: '#1a1a1a', borderRadius: '10px', border: '1px solid #252525' }}>
+                                       <div>
+                                         <p style={{ color: '#999', fontSize: '10px', fontWeight: 700, marginBottom: '2px' }}>Topic {topic.order_number}</p>
+                                         <p style={{ color: '#fff', fontSize: '14px', fontWeight: 600, margin: 0 }}>{topic.title}</p>
+                                       </div>
+                                       <div style={{ display: 'flex', gap: '6px' }}>
+                                         <button onClick={() => { setTopicForm(topic); setShowTopicModal(true) }} style={{ padding: '6px', background: 'transparent', border: 'none', color: '#888', cursor: 'pointer' }}><Edit3 size={14}/></button>
+                                         <button onClick={() => deleteTopic(topic.id)} style={{ padding: '6px', background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer' }}><Trash2 size={14}/></button>
+                                       </div>
+                                    </div>
+                                 ))}
+                              </div>
+                           </div>
+                        )}
+                     </div>
+                   ))}
+                 </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {themes.length === 0 && !loading && <p style={{ color: '#555', textAlign: 'center', marginTop: '40px' }}>No curriculum themes built yet.</p>}
+      </div>
+
+      {/* THEME MODAL */}
+      <AnimatePresence>
+        {showThemeModal && (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowThemeModal(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)' }} />
+            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} style={{ position: 'relative', width: '90%', maxWidth: '400px', background: '#111', borderRadius: '24px', padding: '24px', border: '1px solid #222' }}>
+              <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, margin: '0 0 20px' }}>{themeForm.id ? 'Edit Theme' : 'New Theme'}</h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div><label style={labelStyle}>Theme Name</label><input value={themeForm.name} onChange={e => setThemeForm(p => ({ ...p, name: e.target.value }))} style={inputStyle} /></div>
+                <button onClick={saveTheme} style={{ width: '100%', padding: '14px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, border: 'none', marginTop: '8px', cursor: 'pointer' }}>Save Theme</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODULE MODAL */}
+      <AnimatePresence>
+        {showModModal && (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowModModal(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)' }} />
+            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} style={{ position: 'relative', width: '90%', maxWidth: '400px', background: '#111', borderRadius: '24px', padding: '24px', border: '1px solid #222' }}>
+              <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, margin: '0 0 20px' }}>{modForm.id ? 'Edit Module' : 'New Module'}</h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div><label style={labelStyle}>Title</label><input value={modForm.title} onChange={e => setModForm(p => ({ ...p, title: e.target.value }))} style={inputStyle} /></div>
+                <div><label style={labelStyle}>Order Number</label><input type="number" value={modForm.order_number} onChange={e => setModForm(p => ({ ...p, order_number: parseInt(e.target.value)||0 }))} style={inputStyle} /></div>
+                <button onClick={saveModule} style={{ width: '100%', padding: '14px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, border: 'none', marginTop: '8px', cursor: 'pointer' }}>Save Module</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* TOPIC MODAL */}
+      <AnimatePresence>
+        {showTopicModal && (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowTopicModal(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)' }} />
+            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} style={{ position: 'relative', width: '90%', maxWidth: '400px', background: '#111', borderRadius: '24px', padding: '24px', border: '1px solid #222' }}>
+              <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, margin: '0 0 20px' }}>{topicForm.id ? 'Edit Topic' : 'New Topic'}</h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div><label style={labelStyle}>Topic Title</label><input value={topicForm.title} onChange={e => setTopicForm(p => ({ ...p, title: e.target.value }))} style={inputStyle} /></div>
+                <div><label style={labelStyle}>Order Number</label><input type="number" value={topicForm.order_number} onChange={e => setTopicForm(p => ({ ...p, order_number: parseInt(e.target.value)||0 }))} style={inputStyle} /></div>
+                <button onClick={saveTopic} style={{ width: '100%', padding: '14px', borderRadius: '12px', background: '#2C5F2D', color: '#fff', fontWeight: 700, border: 'none', marginTop: '8px', cursor: 'pointer' }}>Save Topic</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* COACH MODAL */}
+      <AnimatePresence>
+         {showCoachModal && (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setShowCoachModal(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.8)' }} />
+            <motion.div initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }} style={{ position: 'relative', width: '90%', maxWidth: '400px', maxHeight: '80vh', overflowY: 'auto', background: '#111', borderRadius: '24px', padding: '24px', border: '1px solid #222' }}>
+               <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, margin: '0 0 20px' }}>Global Coaches</h3>
+               
+               <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+                  <input value={coachForm.name} onChange={e => setCoachForm({ ...coachForm, name: e.target.value })} placeholder="New coach name..." style={{ flex: 1, ...inputStyle }} />
+                  <button onClick={saveCoach} style={{ padding: '0 16px', borderRadius: '10px', background: '#2C5F2D', color: '#fff', fontWeight: 700, border: 'none', cursor: 'pointer' }}>Add</button>
+               </div>
+
+               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {coaches.map(c => (
+                     <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px', background: '#1a1a1a', borderRadius: '8px', border: '1px solid #333' }}>
+                        <p style={{ color: '#fff', fontSize: '14px', fontWeight: 600, margin: 0 }}>{c.name}</p>
+                        <button onClick={() => deleteCoach(c.id)} style={{ background: 'transparent', border: 'none', color: '#ef4444', padding: '4px', cursor: 'pointer' }}><Trash2 size={16} /></button>
+                     </div>
+                  ))}
+                  {coaches.length === 0 && <p style={{ color: '#555', fontSize: '13px', textAlign: 'center' }}>No coaches added.</p>}
+               </div>
+            </motion.div>
+          </div>
+         )}
+      </AnimatePresence>
+    </PageWrap>
+  )
+}

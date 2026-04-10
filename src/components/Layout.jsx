@@ -1,5 +1,5 @@
 import { NavLink, useLocation } from 'react-router-dom'
-import { Home, Tv2, Wallet, User } from 'lucide-react'
+import { Home, Tv2, Wallet, User, BookOpen } from 'lucide-react'
 import { useAudio } from '../contexts/AudioContext'
 import { motion, AnimatePresence } from 'framer-motion'
 import SermonPlayer from '../pages/SermonPlayer'
@@ -129,13 +129,14 @@ function MiniPlayer() {
   )
 }
 
-// ── BOTTOM NAV (exact CCI 4-tab: Home, Media, Giving, Account) ──
+// ── BOTTOM NAV (exact CCI 5-tab: Home, Media, Giving, Lessons, Account) ──
 function BottomNav() {
   const tabs = [
-    { to: '/home',    icon: Home,   label: 'Home'    },
-    { to: '/media',   icon: Tv2,    label: 'Media'   },
-    { to: '/giving',  icon: Wallet, label: 'Giving'  },
-    { to: '/account', icon: User,   label: 'Account' },
+    { to: '/home',    icon: Home,     label: 'Home'    },
+    { to: '/media',   icon: Tv2,      label: 'Media'   },
+    { to: '/giving',  icon: Wallet,   label: 'Giving'  },
+    { to: '/topics',  icon: BookOpen, label: 'Academy' },
+    { to: '/account', icon: User,     label: 'Account' },
   ]
 
   return (

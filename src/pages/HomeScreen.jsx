@@ -25,6 +25,16 @@ export default function HomeScreen() {
   const [checkingPin, setCheckingPin] = useState(false)
   const [checkInError, setCheckInError] = useState(null)
 
+  // Pathlighters Academy Themes State
+  const [themes, setThemes] = useState([])
+  const [coaches, setCoaches] = useState([])
+  const [selectedTopic, setSelectedTopic] = useState(null)
+  const [selectedCoach, setSelectedCoach] = useState(null)
+  const [checkInStep, setCheckInStep] = useState('topic') // 'topic' or 'coach'
+  const [submittingTopic, setSubmittingTopic] = useState(false)
+  const [attendanceRecord, setAttendanceRecord] = useState(null)
+  const [needsTopicSelection, setNeedsTopicSelection] = useState(false)
+
   // Derive first name from full_name
   const firstName = profile?.full_name
     ? profile.full_name.trim().split(' ')[0]
@@ -66,11 +76,49 @@ export default function HomeScreen() {
         
         if (todayRec?.length) {
           setCheckedInToday(true)
+          setAttendanceRecord(todayRec[0])
           setSessionInfo(todayRec[0].attendance_sessions || { service_type: 'Sunday Service' })
+
+          // Check if they already submitted a topic today
+          const { data: taData } = await supabase
+            .from('topic_attendance')
+            .select('id')
+            .eq('attendance_id', todayRec[0].id)
+            .limit(1)
+            
+          if (!taData?.length) setNeedsTopicSelection(true)
         }
       }
+
+      // Fetch Active Curriculum for Selection
+      const { data: qThemes } = await supabase
+        .from('themes')
+        .select(`*, modules(*, topics(*))`)
+        .eq('is_active', true)
+        
+      if (qThemes) {
+        qThemes.forEach(t => {
+          t.modules?.sort((a,b) => a.order_number - b.order_number)
+          t.modules?.forEach(m => m.topics?.sort((a,b) => a.order_number - b.order_number))
+        })
+        setThemes(qThemes)
+      }
+
+      const { data: qCoaches } = await supabase
+        .from('coaches')
+        .select('*')
+        .eq('is_active', true)
+        .order('name', { ascending: true })
+      if (qCoaches) setCoaches(qCoaches)
     }
     load()
+
+    const searchParams = new URLSearchParams(window.location.search)
+    if (searchParams.get('checked_in') === 'true') {
+        setShowCheckIn(true)
+        window.history.replaceState({}, document.title, window.location.pathname)
+    }
+
     // ... realtime subscriptions keep existing logic ...
 
     // 🔴 Real-time: featured flier changes by admin → instant update for all users
@@ -134,9 +182,10 @@ export default function HomeScreen() {
     }
 
     // 3. Record attendance in attendance_records (same table admin reads)
-    const { error: aErr } = await supabase
+    const { data: aData, error: aErr } = await supabase
       .from('attendance_records')
       .insert({ user_id: profile.id, session_id: targetSession.id })
+      .select().single()
 
     if (aErr) {
       if (aErr.code === '23505') setCheckInError('Already checked in for this session!')
@@ -161,9 +210,39 @@ export default function HomeScreen() {
     
     setStreak(newStreak)
     setSessionInfo(targetSession)
+    setAttendanceRecord(aData)
+    setNeedsTopicSelection(true)
     setCheckedInToday(true)
     setCheckingPin(false)
     setShowPinInput(false)
+  }
+
+  const handleSkipTopic = () => {
+     setNeedsTopicSelection(false)
+     setCheckInStep('topic')
+  }
+
+  const handleNextToCoach = () => {
+    if (selectedTopic) setCheckInStep('coach')
+  }
+
+  const handleSubmitTopic = async () => {
+      if (!selectedTopic || !selectedCoach) return
+      setSubmittingTopic(true)
+      const { error } = await supabase.from('topic_attendance').insert({
+          user_id: profile.id,
+          topic_id: selectedTopic,
+          coach_id: selectedCoach,
+          attendance_id: attendanceRecord?.id,
+          session_id: sessionInfo?.id
+      })
+      setSubmittingTopic(false)
+      if (!error) {
+          setNeedsTopicSelection(false)
+          setCheckInStep('topic')
+      } else {
+          alert('Failed to submit. Try again.')
+      }
   }
 
   const handleManualCheckInPlaceholder = async () => {
@@ -444,25 +523,148 @@ export default function HomeScreen() {
               <div style={{ width: '36px', height: '4px', borderRadius: '4px', background: '#2a2a2a', margin: '8px auto 24px' }} />
 
               {checkedInToday ? (
-                // Already checked in - SUCCESS STATE
-                <div style={{ textAlign: 'center', paddingBottom: '16px' }}>
-                  <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: '#1a2e10', border: '2px solid #2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                    <span style={{ fontSize: '32px' }}>✅</span>
+                (needsTopicSelection && themes.some(t => t.modules?.some(m => m.topics?.length > 0))) ? (
+                  // Curriculum: Multi-step Selection
+                  <div style={{ paddingBottom: '16px' }}>
+                    <AnimatePresence mode="wait">
+                      {checkInStep === 'topic' ? (
+                        <motion.div 
+                          key="step-topic"
+                          initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -20, opacity: 0 }}
+                        >
+                          <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, marginBottom: '6px' }}>What were you taught today?</h3>
+                          <p style={{ color: '#aaa', fontSize: '14px', marginBottom: '24px' }}>Select the topic from today's active curriculum</p>
+                          
+                          <div style={{ maxHeight: '40vh', overflowY: 'auto', marginBottom: '24px', display: 'flex', flexDirection: 'column', gap: '20px' }} className="no-scrollbar">
+                              {themes.map(theme => {
+                                const hasContent = theme.modules?.some(m => m.topics?.length > 0);
+                                if (!hasContent) return null;
+                                return (
+                                  <div key={theme.id} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                      <div style={{ flex: 1, height: '1px', background: '#222' }} />
+                                      <p style={{ color: '#888', fontSize: '11px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', margin: 0 }}>{theme.name}</p>
+                                      <div style={{ flex: 1, height: '1px', background: '#222' }} />
+                                    </div>
+                                    
+                                    {theme.modules.filter(m => m.topics?.length > 0).map(m => (
+                                      <div key={m.id}>
+                                          <p style={{ color: '#d4af37', fontSize: '11px', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>{m.title}</p>
+                                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                            {m.topics.map(t => (
+                                                <div 
+                                                  key={t.id} 
+                                                  onClick={() => setSelectedTopic(t.id)}
+                                                  style={{ 
+                                                      padding: '14px', borderRadius: '12px', cursor: 'pointer',
+                                                      background: selectedTopic === t.id ? '#1a2e10' : '#1a1a1a', 
+                                                      border: `1.5px solid ${selectedTopic === t.id ? '#2C5F2D' : '#2a2a2a'}` 
+                                                  }}
+                                                >
+                                                  <p style={{ color: '#fff', fontSize: '14px', fontWeight: 700, margin: 0 }}>{t.title}</p>
+                                                </div>
+                                            ))}
+                                          </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )
+                              })}
+                          </div>
+
+                          <div style={{ display: 'flex', gap: '12px' }}>
+                              <button
+                                onClick={handleSkipTopic}
+                                style={{ flex: 1, padding: '14px', borderRadius: '100px', background: 'transparent', color: '#888', fontWeight: 700, fontSize: '14px', border: '1.5px solid #2a2a2a', cursor: 'pointer' }}
+                              >
+                                Skip
+                              </button>
+                              <AnimatePresence>
+                                {selectedTopic && (
+                                    <motion.button
+                                      initial={{ width: 0, opacity: 0 }} animate={{ width: 'auto', opacity: 1, flex: 2 }} exit={{ width: 0, opacity: 0 }}
+                                      onClick={handleNextToCoach}
+                                      style={{ padding: '14px', borderRadius: '100px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '14px', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden' }}
+                                    >
+                                      Continue
+                                    </motion.button>
+                                )}
+                              </AnimatePresence>
+                          </div>
+                        </motion.div>
+                      ) : (
+                        <motion.div 
+                          key="step-coach"
+                          initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -20, opacity: 0 }}
+                        >
+                          <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, marginBottom: '6px' }}>Who taught this session?</h3>
+                          <p style={{ color: '#aaa', fontSize: '14px', marginBottom: '24px' }}>Select your coach for today's topic</p>
+                          
+                          <div style={{ maxHeight: '40vh', overflowY: 'auto', marginBottom: '24px', display: 'flex', flexDirection: 'column', gap: '10px' }} className="no-scrollbar">
+                              {coaches.map(c => (
+                                <div 
+                                  key={c.id} 
+                                  onClick={() => setSelectedCoach(c.id)}
+                                  style={{ 
+                                      padding: '16px', borderRadius: '14px', cursor: 'pointer',
+                                      background: selectedCoach === c.id ? '#1a2e10' : '#1a1a1a', 
+                                      border: `1.5px solid ${selectedCoach === c.id ? '#2C5F2D' : '#2a2a2a'}`,
+                                      display: 'flex', alignItems: 'center', gap: '12px'
+                                  }}
+                                >
+                                  <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: '#2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: '12px' }}>
+                                    {c.name.charAt(0)}
+                                  </div>
+                                  <p style={{ color: '#fff', fontSize: '15px', fontWeight: 600, margin: 0 }}>{c.name}</p>
+                                </div>
+                              ))}
+                          </div>
+
+                          <div style={{ display: 'flex', gap: '12px' }}>
+                              <button
+                                onClick={() => setCheckInStep('topic')}
+                                style={{ flex: 1, padding: '14px', borderRadius: '100px', background: 'transparent', color: '#888', fontWeight: 700, fontSize: '14px', border: '1.5px solid #2a2a2a', cursor: 'pointer' }}
+                              >
+                                Back
+                              </button>
+                              <AnimatePresence>
+                                {selectedCoach && (
+                                    <motion.button
+                                      initial={{ width: 0, opacity: 0 }} animate={{ width: 'auto', opacity: 1, flex: 2 }} exit={{ width: 0, opacity: 0 }}
+                                      onClick={handleSubmitTopic}
+                                      disabled={submittingTopic}
+                                      style={{ padding: '14px', borderRadius: '100px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '14px', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden' }}
+                                    >
+                                      {submittingTopic ? 'Submitting...' : 'Complete Check-in'}
+                                    </motion.button>
+                                )}
+                              </AnimatePresence>
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                   </div>
-                  <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, marginBottom: '8px' }}>Checked in! ✨</h3>
-                  <p style={{ color: '#aaa', fontSize: '14px', marginBottom: '8px' }}>
-                    {sessionInfo?.service_type || 'Sunday Service'}
-                  </p>
-                  <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 700, marginBottom: '24px' }}>
-                    🔥 {streak} Sunday Streak
-                  </p>
-                  <button
-                    onClick={() => setShowCheckIn(false)}
-                    style={{ width: '100%', padding: '16px', borderRadius: '100px', background: '#1a1a1a', color: '#fff', fontWeight: 700, fontSize: '15px', border: '1px solid #2a2a2a', cursor: 'pointer' }}
-                  >
-                    Done
-                  </button>
-                </div>
+                ) : (
+                  // Already checked in - SUCCESS STATE
+                  <div style={{ textAlign: 'center', paddingBottom: '16px' }}>
+                    <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: '#1a2e10', border: '2px solid #2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+                      <span style={{ fontSize: '32px' }}>✅</span>
+                    </div>
+                    <h3 style={{ color: '#fff', fontSize: '20px', fontWeight: 700, marginBottom: '8px' }}>Check-in complete! ✨</h3>
+                    <p style={{ color: '#aaa', fontSize: '14px', marginBottom: '8px' }}>
+                      {sessionInfo?.service_type || 'Sunday Service'}
+                    </p>
+                    <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 700, marginBottom: '24px' }}>
+                      🔥 {streak} Sunday Streak
+                    </p>
+                    <button
+                      onClick={() => setShowCheckIn(false)}
+                      style={{ width: '100%', padding: '16px', borderRadius: '100px', background: '#1a1a1a', color: '#fff', fontWeight: 700, fontSize: '15px', border: '1px solid #2a2a2a', cursor: 'pointer' }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                )
               ) : showPinInput ? (
                 // PIN Input State
                 <>
