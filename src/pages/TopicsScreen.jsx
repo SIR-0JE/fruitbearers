@@ -19,7 +19,6 @@ export default function TopicsScreen() {
       const { data: qThemes } = await supabase
         .from('themes')
         .select(`*, modules(*, topics(*))`)
-        .eq('is_active', true)
         .order('created_at', { ascending: false })
 
       // Fetch user's completed topics with Coach names

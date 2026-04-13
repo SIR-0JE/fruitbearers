@@ -1,6 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { supabase } from '../lib/supabase'
+import { toast } from 'react-hot-toast'
 import { useAuth } from '../contexts/AuthContext'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
+import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import * as tus from 'tus-js-client'
@@ -13,6 +16,7 @@ import {
 } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 
+
 const NAV = [
   { id: 'overview',   icon: LayoutDashboard, label: 'Overview'    },
   { id: 'home',       icon: ImageIcon,        label: 'Home Page'  },
@@ -22,40 +26,64 @@ const NAV = [
   { id: 'birthday',   icon: Gift,             label: 'Birthdays'  },
   { id: 'broadcast',  icon: Megaphone,        label: 'Broadcast'  },
   { id: 'giving',     icon: DollarSign,       label: 'Giving'     },
-  { id: 'themes',     icon: BookOpen,         label: 'Curriculum'    },
+  { id: 'themes',     icon: BookOpen,         label: 'Curriculum' },
+  { id: 'socials',    icon: ExternalLink,     label: 'Socials'    },
 ]
+
+// ── Simple Skeleton Component ──────────────────────────
+const Skeleton = ({ count = 1, height = 20, width = '100%' }) => (
+  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width }}>
+    {Array.from({ length: count }).map((_, i) => (
+      <div key={i} className="skeleton" style={{ height, width: '100%', borderRadius: '8px', background: 'rgba(255,255,255,0.05)' }} />
+    ))}
+  </div>
+)
 
 export default function AdminDashboard() {
   const { profile, signOut } = useAuth()
   const navigate = useNavigate()
   const [active, setActive] = useState('overview')
-  const [stats, setStats] = useState({ members: 0, checkins: 0, sermons: 0, giving: 0 })
-  
-  // ── Global Background Uploader State
   const [bgUpload, setBgUpload] = useState({ active: false, progress: 0, text: '', filename: '', error: null, success: false })
+  // ── Stats Fetching (React Query) ──
+  const { data: stats = { members: 0, checkins: 0, sermons: 0, giving: 0 }, isLoading: loadingStats } = useSupabaseQuery(
+    ['admin', 'stats'],
+    async () => {
+      const today = new Date().toISOString().split('T')[0]
+      const [m, a, s] = await Promise.all([
+        supabase.from('profiles').select('id', { count: 'exact', head: true }),
+        supabase.from('attendance_records').select('id', { count: 'exact', head: true }).gte('timestamp', today),
+        supabase.from('sermons').select('id', { count: 'exact', head: true }),
+      ])
+      return { members: m.count || 0, checkins: a.count || 0, sermons: s.count || 0 }
+    },
+    { refetchInterval: 30000 } // Refetch every 30s
+  )
 
+  const queryClient = useQueryClient()
+
+  // Prefetch critical data when dashboard loads
   useEffect(() => {
-    loadStats()
-
-    // 🔴 Real-time: update stats when members, attendance, or sermons change
-    const channel = supabase.channel('admin-stats-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, loadStats)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance' }, loadStats)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'sermons' }, loadStats)
-      .subscribe()
-
-    return () => supabase.removeChannel(channel)
-  }, [])
-
-  const loadStats = async () => {
     const today = new Date().toISOString().split('T')[0]
-    const [m, a, s] = await Promise.all([
-      supabase.from('profiles').select('id', { count: 'exact', head: true }),
-      supabase.from('attendance_records').select('id', { count: 'exact', head: true }).gte('created_at', today),
-      supabase.from('sermons').select('id', { count: 'exact', head: true }),
-    ])
-    setStats({ members: m.count || 0, checkins: a.count || 0, sermons: s.count || 0 })
-  }
+    
+    // Prefetch members — must return plain array to match useSupabaseQuery output
+    queryClient.prefetchQuery({
+      queryKey: ['admin', 'members'],
+      queryFn: async () => {
+        const { data } = await supabase.from('profiles').select('*').order('created_at', { ascending: false })
+        return data || []
+      }
+    })
+
+    // Prefetch attendance
+    queryClient.prefetchQuery({
+      queryKey: ['admin', 'attendance', today],
+      queryFn: async () => {
+        const { data: s } = await supabase.from('attendance_sessions').select('id').eq('service_date', today)
+        const sessionIds = s?.map(x => x.id) || []
+        return supabase.from('attendance_records').select('user_id, session_id').in('session_id', sessionIds)
+      }
+    })
+  }, [queryClient])
 
   const handleSignOut = async () => { await signOut(); navigate('/admin-portal') }
 
@@ -223,6 +251,7 @@ export default function AdminDashboard() {
           {active === 'broadcast'  && <CommunicationTab key="bc" />}
           {active === 'giving'     && <GivingTab     key="gv" />}
           {active === 'themes'     && <ThemesTab     key="th" />}
+          {active === 'socials'    && <SocialsTab    key="sc" />}
         </AnimatePresence>
       </main>
 
@@ -301,31 +330,20 @@ function StatCard({ icon, label, value, sub, color = '#2C5F2D' }) {
 // OVERVIEW TAB
 // ════════════════════════════════════
 function OverviewTab({ stats }) {
-  const [recentMembers, setRecentMembers] = useState([])
-  const [todayAttendance, setTodayAttendance] = useState([])
+  const { data: recentMembers = [], isLoading: loadingMembers } = useSupabaseQuery(
+    ['admin', 'recent_members'],
+    () => supabase.from('profiles').select('id, full_name, email, campus, created_at').order('created_at', { ascending: false }).limit(5)
+  )
+
+  const { data: todayAttendance = [], isLoading: loadingAttendance } = useSupabaseQuery(
+    ['admin', 'today_attendance'],
+    () => {
+      const today = new Date().toISOString().split('T')[0]
+      return supabase.from('attendance_records').select('user_id, timestamp, profiles(full_name)').gte('timestamp', today).order('timestamp', { ascending: false }).limit(10)
+    }
+  )
+
   const magicLink = `${window.location.origin}/admin-portal?u=FRUITBEARERS&p=INSIDEOUT`
-
-  const loadData = () => {
-    const today = new Date().toISOString().split('T')[0]
-    supabase.from('profiles').select('id, full_name, email, campus, created_at').order('created_at', { ascending: false }).limit(5)
-      .then(({ data }) => setRecentMembers(data || []))
-    // Add sorting so the newest checkins rise to the top
-    supabase.from('attendance_records').select('user_id, created_at, profiles(full_name)').gte('created_at', today).order('created_at', { ascending: false }).limit(10)
-      .then(({ data }) => setTodayAttendance(data || []))
-  }
-
-  useEffect(() => {
-    loadData()
-
-    // 🔴 Real-time: Listen to ALL events (*) so 'upserted' profiles also show up instantly
-    const channel = supabase.channel('overview-live')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, loadData)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_records' }, loadData)
-      .subscribe()
-
-    return () => supabase.removeChannel(channel)
-  }, [])
-
   const copyLink = () => { navigator.clipboard?.writeText(magicLink); }
 
   return (
@@ -367,7 +385,7 @@ function OverviewTab({ stats }) {
         {/* Recent Members */}
         <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '16px', padding: '20px' }}>
           <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 16px' }}>Recent Members</p>
-          {recentMembers.length === 0
+          {loadingMembers ? <Skeleton count={5} height={40} /> : recentMembers.length === 0
             ? <p style={{ color: '#333', fontSize: '13px' }}>No members yet</p>
             : recentMembers.map(m => (
               <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
@@ -386,7 +404,7 @@ function OverviewTab({ stats }) {
         {/* Today's check-ins */}
         <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '16px', padding: '20px' }}>
           <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 16px' }}>Today's Check-ins</p>
-          {todayAttendance.length === 0
+          {loadingAttendance ? <Skeleton count={5} height={40} /> : todayAttendance.length === 0
             ? <p style={{ color: '#333', fontSize: '13px' }}>No check-ins recorded yet today</p>
             : todayAttendance.map((a, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
@@ -395,7 +413,7 @@ function OverviewTab({ stats }) {
                   {a.profiles?.full_name || 'Unknown member'}
                 </p>
                 <span style={{ marginLeft: 'auto', color: '#444', fontSize: '11px', flexShrink: 0 }}>
-                  {new Date(a.checked_in_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
+                  {a.timestamp ? new Date(a.timestamp).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : 'N/A'}
                 </span>
               </div>
             ))
@@ -543,9 +561,55 @@ function HomePageTab() {
             <p style={{ color: '#2C5F2D', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 8px' }}>How it works</p>
             <p style={{ color: '#555', fontSize: '12px', lineHeight: 1.6, margin: 0 }}>Upload a new flier every Sunday. It replaces the previous one automatically. Members on the home screen will see the new image in real-time and can share it with friends.</p>
           </div>
+
+          {/* Prayer Link Setting */}
+          <PrayerLinkSetting />
         </div>
       </div>
     </PageWrap>
+  )
+}
+
+// Sub-component so it has its own state lifecycle
+function PrayerLinkSetting() {
+  const [link, setLink] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    supabase.from('app_settings').select('value').eq('key', 'prayer_link').single()
+      .then(({ data }) => { if (data?.value) setLink(data.value) })
+  }, [])
+
+  const save = async () => {
+    setSaving(true)
+    await supabase.from('app_settings').upsert({ key: 'prayer_link', value: link })
+    setSaving(false)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 3000)
+  }
+
+  return (
+    <div style={{ marginTop: '20px', padding: '20px', background: '#0d160d', borderRadius: '14px', border: '1px solid rgba(44,95,45,0.15)' }}>
+      <p style={{ color: '#2C5F2D', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 8px' }}>🤲 Prayer Request Link</p>
+      <p style={{ color: '#555', fontSize: '12px', lineHeight: 1.5, margin: '0 0 14px' }}>When members tap "Ask for Prayer" on their home screen, they'll be sent to this link (e.g. a WhatsApp link, Google Form, or Typeform).</p>
+      <div style={{ display: 'flex', gap: '8px' }}>
+        <input
+          type="url"
+          value={link}
+          onChange={e => setLink(e.target.value)}
+          placeholder="https://wa.me/..."
+          style={{ flex: 1, background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit' }}
+        />
+        <button
+          onClick={save}
+          disabled={saving || !link.trim()}
+          style={{ padding: '10px 18px', borderRadius: '10px', background: saved ? '#1a2e1a' : '#2C5F2D', border: 'none', color: saved ? '#2C5F2D' : '#fff', fontWeight: 700, fontSize: '13px', cursor: 'pointer', flexShrink: 0, transition: 'all 0.2s' }}
+        >
+          {saving ? 'Saving...' : saved ? '✅ Saved!' : 'Save Link'}
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -553,45 +617,45 @@ function HomePageTab() {
 // ATTENDANCE TAB
 // ════════════════════════════════════
 function AttendanceTab() {
+  const queryClient = useQueryClient()
   const [date, setDate]         = useState(new Date().toISOString().split('T')[0])
-  const [members, setMembers]   = useState([])
-  const [checkins, setCheckins] = useState([])
-  const [loading, setLoading]   = useState(true)
   const [emailTarget, setEmailTarget] = useState(null)
   
-  // New session state
-  const [sessions, setSessions] = useState([])
   const [showCreate, setShowCreate] = useState(false)
   const [newSession, setNewSession] = useState({ name: 'Sunday Service', type: 'First Service', end_time: '' })
   const [activeSession, setActiveSession] = useState(null)
   const [isCreating, setIsCreating] = useState(false)
 
-  const load = async () => {
-    setLoading(true)
-    const [ { data: m }, { data: a }, { data: s } ] = await Promise.all([
-      supabase.from('profiles').select('id, full_name, email, attendance_streak').eq('role', 'member'),
-      // ✅ FIXED: reading from attendance_records (same table users write to)
-      supabase.from('attendance_records').select('user_id, session_id').in(
-        'session_id',
-        (await supabase.from('attendance_sessions').select('id').eq('service_date', date)).data?.map(s => s.id) || []
-      ),
-      supabase.from('attendance_sessions').select('*').eq('service_date', date).order('created_at', { ascending: false })
-    ])
-    setMembers(m || [])
-    setSessions(s || [])
-    setCheckins((a || []).map(x => x.user_id))
-    setLoading(false)
-  }
+  // Curriculum attachment (optional)
+  const [selectedModuleId, setSelectedModuleId] = useState('')
+  const [selectedTopicId, setSelectedTopicId] = useState('')
 
-  useEffect(() => {
-    load()
-    const channel = supabase.channel(`attendance-${date}`)
-      // ✅ FIXED: listening to attendance_records
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_records' }, load)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance_sessions' }, load)
-      .subscribe()
-    return () => supabase.removeChannel(channel)
-  }, [date])
+  // Fetch all modules with their parent theme name and topics (for dropdown)
+  const { data: allModules = [] } = useSupabaseQuery(
+    ['admin', 'modules_for_session'],
+    () => supabase.from('modules').select('*, topics(*), themes(name)').order('order_number')
+  )
+
+  const { data: attendanceData = { members: [], checkins: [], sessions: [] }, isLoading: loading } = useSupabaseQuery(
+    ['admin', 'attendance', date],
+    async () => {
+      const [ { data: m }, { data: s } ] = await Promise.all([
+        supabase.from('profiles').select('id, full_name, email, attendance_streak').eq('role', 'member'),
+        supabase.from('attendance_sessions').select('*').eq('service_date', date).order('created_at', { ascending: false })
+      ])
+      
+      const sessionIds = s?.map(x => x.id) || []
+      const { data: a } = await supabase.from('attendance_records').select('user_id, session_id').in('session_id', sessionIds)
+      
+      return {
+        members: m || [],
+        sessions: s || [],
+        checkins: (a || []).map(x => x.user_id)
+      }
+    }
+  )
+
+  const { members = [], sessions = [], checkins = [] } = attendanceData
 
   const createSession = async () => {
     if (!newSession.end_time) {
@@ -613,13 +677,16 @@ function AttendanceTab() {
       qr_code_value: qrValue,
       pin: pin,
       expires_at: expiresAt,
-      is_active: true
+      is_active: true,
+      topic_id: selectedTopicId || null,
     }).select().single()
     
     if (!error) {
       setActiveSession(data)
       setShowCreate(false)
-      load()
+      setSelectedModuleId('')
+      setSelectedTopicId('')
+      queryClient.invalidateQueries(['admin', 'attendance', date])
     } else {
       console.error(error)
       alert('Error creating session: ' + error.message)
@@ -659,8 +726,8 @@ function AttendanceTab() {
     img.src = 'data:image/svg+xml;base64,' + btoa(svgData)
   }
 
-  const present = members.filter(m => checkins.includes(m.id))
-  const missed  = members.filter(m => !checkins.includes(m.id))
+  const present = (members || []).filter(m => (checkins || []).includes(m.id))
+  const missed  = (members || []).filter(m => !(checkins || []).includes(m.id))
 
   return (
     <PageWrap 
@@ -720,7 +787,10 @@ function AttendanceTab() {
 
       {/* Tables container */}
       {loading ? (
-        <p style={{ color: '#444' }}>Loading...</p>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+          <Skeleton count={10} height={40} />
+          <Skeleton count={10} height={40} />
+        </div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
           {/* Present */}
@@ -812,6 +882,57 @@ function AttendanceTab() {
                     </div>
                  </div>
 
+                 {/* ── Curriculum Attachment (Optional) ── */}
+                 <div style={{ borderTop: '1px solid rgba(44,95,45,0.1)', paddingTop: '16px' }}>
+                   <p style={{ color: '#444', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 14px' }}>
+                     📚 Attach Curriculum Topic <span style={{ color: '#333', fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>(optional)</span>
+                   </p>
+
+                   {/* Module dropdown */}
+                   <div style={{ marginBottom: '12px' }}>
+                     <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>Module</label>
+                     <select
+                       value={selectedModuleId}
+                       onChange={e => { setSelectedModuleId(e.target.value); setSelectedTopicId('') }}
+                       style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '12px 14px', color: selectedModuleId ? '#fff' : '#555', outline: 'none', fontSize: '14px', cursor: 'pointer' }}
+                     >
+                       <option value="">— No curriculum this session —</option>
+                       {allModules.map(m => (
+                         <option key={m.id} value={m.id}>
+                           {m.themes?.name ? `${m.themes.name} → ` : ''}{m.title}
+                         </option>
+                       ))}
+                     </select>
+                   </div>
+
+                   {/* Topic dropdown (only when module selected) */}
+                   {selectedModuleId && (
+                     <div style={{ marginBottom: '12px' }}>
+                       <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>Topic</label>
+                       <select
+                         value={selectedTopicId}
+                         onChange={e => setSelectedTopicId(e.target.value)}
+                         style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '12px 14px', color: selectedTopicId ? '#fff' : '#555', outline: 'none', fontSize: '14px', cursor: 'pointer' }}
+                       >
+                         <option value="">— Select a topic —</option>
+                         {(allModules.find(m => m.id === selectedModuleId)?.topics || []).map(t => (
+                           <option key={t.id} value={t.id}>{t.title}</option>
+                         ))}
+                       </select>
+                     </div>
+                   )}
+
+                   {/* Confirmation hint */}
+                   {selectedTopicId && (() => {
+                     const topicTitle = allModules.find(m => m.id === selectedModuleId)?.topics?.find(t => t.id === selectedTopicId)?.title
+                     return topicTitle ? (
+                       <p style={{ color: '#2C5F2D', fontSize: '12px', fontWeight: 600, background: 'rgba(44,95,45,0.08)', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 12px', margin: 0 }}>
+                         ✅ Members who check in today will be asked who taught: <strong>"{topicTitle}"</strong>
+                       </p>
+                     ) : null
+                   })()}
+                 </div>
+
                  <p style={{ color: '#444', fontSize: '12px', margin: 0, fontStyle: 'italic' }}>
                    The QR code and PIN will automatically expire at the set end time.
                  </p>
@@ -900,28 +1021,15 @@ function MemberRow({ member, isPresent, action }) {
 // MEMBERS TAB
 // ════════════════════════════════════
 function MembersTab() {
-  const [members, setMembers] = useState([])
   const [search, setSearch]   = useState('')
-  const [loading, setLoading] = useState(true)
   const [selectedMember, setSelectedMember] = useState(null)
 
-  const loadMembers = () => {
-    supabase.from('profiles').select('*').order('created_at', { ascending: false })
-      .then(({ data }) => { setMembers(data || []); setLoading(false) })
-  }
+  const { data: members = [], isLoading: loading } = useSupabaseQuery(
+    ['admin', 'members'],
+    () => supabase.from('profiles').select('*').order('created_at', { ascending: false })
+  )
 
-  useEffect(() => {
-    loadMembers()
-
-    // 🔴 Real-time: update member list when someone signs up
-    const channel = supabase.channel('members-table-live')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, loadMembers)
-      .subscribe()
-
-    return () => supabase.removeChannel(channel)
-  }, [])
-
-  const filtered = members.filter(m => {
+  const filtered = (members || []).filter(m => {
     const term = search.toLowerCase()
     const nameMatch = m.full_name?.toLowerCase().includes(term)
     const emailMatch = m.email?.toLowerCase().includes(term)
@@ -933,7 +1041,7 @@ function MembersTab() {
   // Role toggling is now handled inside UserProfileModal
 
   return (
-    <PageWrap title="Members" subtitle={`${members.filter(m => m.role === 'member').length} registered members`}>
+    <PageWrap title="Members" subtitle={`${(members || []).filter(m => m.role === 'member').length} registered members`}>
       <div style={{ marginBottom: '16px' }}>
         <input
           value={search}
@@ -955,7 +1063,7 @@ function MembersTab() {
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={4} style={{ padding: '40px', textAlign: 'center', color: '#444' }}>Loading...</td></tr>
+              <tr><td colSpan={4} style={{ padding: '20px' }}><Skeleton count={10} height={40} /></td></tr>
             ) : filtered.map(m => (
               <tr key={m.id} onClick={() => setSelectedMember(m)} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)', cursor: 'pointer', transition: 'background 0.2s' }} onMouseOver={e => e.currentTarget.style.background='rgba(44,95,45,0.1)'} onMouseOut={e => e.currentTarget.style.background='transparent'}>
                 <td style={{ padding: '14px 20px' }}>
@@ -1267,59 +1375,141 @@ function MediaTab({ onStartUpload }) {
 // ════════════════════════════════════
 function GivingTab() {
   const [logs, setLogs] = useState([])
-  const [loading, setLoading] = useState(true)
+  const [loadingLogs, setLoadingLogs] = useState(true)
+  const [accounts, setAccounts] = useState([])
+  const [loadingAccounts, setLoadingAccounts] = useState(true)
+  const [savingAccount, setSavingAccount] = useState(false)
+  const [newAccount, setNewAccount] = useState({ account_name: '', account_no: '', bank_name: '', category: 'Offering', is_active: true })
 
-  useEffect(() => {
+  const loadLogs = () => {
     supabase.from('giving').select('*, profile:user_id(full_name)').order('created_at', { ascending: false }).limit(20)
-      .then(({ data }) => { if (data) setLogs(data); setLoading(false) })
-  }, [])
+      .then(({ data }) => { if (data) setLogs(data); setLoadingLogs(false) })
+  }
+  const loadAccounts = () => {
+    supabase.from('giving_accounts').select('*').order('created_at')
+      .then(({ data }) => { setAccounts(data || []); setLoadingAccounts(false) })
+  }
+
+  useEffect(() => { loadLogs(); loadAccounts() }, [])
+
+  const addAccount = async () => {
+    if (!newAccount.account_name || !newAccount.account_no || !newAccount.bank_name) {
+      alert('Please fill in all account fields'); return
+    }
+    setSavingAccount(true)
+    const { error } = await supabase.from('giving_accounts').insert(newAccount)
+    if (!error) {
+      setNewAccount({ account_name: '', account_no: '', bank_name: '', category: 'Offering', is_active: true })
+      loadAccounts()
+    } else {
+      alert('Error: ' + error.message)
+    }
+    setSavingAccount(false)
+  }
+
+  const deleteAccount = async (id) => {
+    if (!confirm('Remove this account?')) return
+    await supabase.from('giving_accounts').delete().eq('id', id)
+    loadAccounts()
+  }
+
+  const fieldStyle = { width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }
+  const labelStyle = { display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '6px' }
 
   return (
-    <PageWrap title="Finance" subtitle="Manage church donations and account numbers">
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '32px' }}>
+    <PageWrap title="Finance" subtitle="Manage church bank accounts and view giving logs">
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: '32px', alignItems: 'start' }}>
+
+        {/* ── Recent Giving Logs ── */}
         <div style={{ background: '#0d160d', borderRadius: '24px', border: '1px solid rgba(44,95,45,0.2)', overflow: 'hidden' }}>
           <div style={{ padding: '20px 24px', borderBottom: '1px solid rgba(44,95,45,0.1)' }}>
             <h3 style={{ color: '#fff', fontWeight: 700, margin: 0 }}>Recent Online Giving</h3>
           </div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
-               <thead>
-                 <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                    <th style={{ padding: '16px 24px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase' }}>Member</th>
-                    <th style={{ padding: '16px 24px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase' }}>Amount</th>
-                    <th style={{ padding: '16px 24px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase' }}>Category</th>
-                    <th style={{ padding: '16px 24px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase' }}>Status</th>
-                 </tr>
-               </thead>
-               <tbody>
-                  {logs.map(log => (
-                    <tr key={log.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                      <td style={{ padding: '16px 24px', color: '#fff', fontSize: '13px', fontWeight: 600 }}>{log.profile?.full_name || 'Anonymous'}</td>
-                      <td style={{ padding: '16px 24px', color: '#2C5F2D', fontSize: '13px', fontWeight: 800 }}>₦{log.amount?.toLocaleString()}</td>
-                      <td style={{ padding: '16px 24px', color: '#fff', fontSize: '13px' }}>{log.category}</td>
-                      <td style={{ padding: '16px 24px' }}>
-                        <span style={{ padding: '4px 10px', borderRadius: '100px', background: '#1a2e1a', color: '#2C5F2D', fontSize: '10px', fontWeight: 800 }}>{log.status}</span>
-                      </td>
-                    </tr>
+              <thead>
+                <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                  {['Member', 'Amount', 'Category', 'Status'].map(h => (
+                    <th key={h} style={{ padding: '16px 24px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase' }}>{h}</th>
                   ))}
-                  {logs.length === 0 && !loading && <tr><td colSpan="4" style={{ padding: '40px', textAlign: 'center', color: '#333' }}>No giving logs found.</td></tr>}
-               </tbody>
+                </tr>
+              </thead>
+              <tbody>
+                {logs.map(log => (
+                  <tr key={log.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                    <td style={{ padding: '16px 24px', color: '#fff', fontSize: '13px', fontWeight: 600 }}>{log.profile?.full_name || 'Anonymous'}</td>
+                    <td style={{ padding: '16px 24px', color: '#2C5F2D', fontSize: '13px', fontWeight: 800 }}>₦{log.amount?.toLocaleString()}</td>
+                    <td style={{ padding: '16px 24px', color: '#fff', fontSize: '13px' }}>{log.category}</td>
+                    <td style={{ padding: '16px 24px' }}>
+                      <span style={{ padding: '4px 10px', borderRadius: '100px', background: '#1a2e1a', color: '#2C5F2D', fontSize: '10px', fontWeight: 800 }}>{log.status}</span>
+                    </td>
+                  </tr>
+                ))}
+                {logs.length === 0 && !loadingLogs && (
+                  <tr><td colSpan="4" style={{ padding: '40px', textAlign: 'center', color: '#333' }}>No giving logs found.</td></tr>
+                )}
+              </tbody>
             </table>
           </div>
         </div>
 
+        {/* ── Bank Account Manager ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-           <div style={{ background: '#1a2e1a', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '24px', padding: '24px' }}>
-             <Landmark size={32} color="#2C5F2D" style={{ marginBottom: '16px' }} />
-             <h4 style={{ color: '#fff', fontWeight: 700, margin: '0 0 8px' }}>Manage Accounts</h4>
-             <p style={{ color: '#aaa', fontSize: '12px', lineHeight: 1.5, margin: '0 0 20px' }}>Bank details added here will appear in the member app instantly.</p>
-             <button style={{ width: '100%', padding: '12px', borderRadius: '10px', background: '#2C5F2D', border: 'none', color: '#fff', fontWeight: 700, fontSize: '13px', cursor: 'pointer' }}>Edit Account Details</button>
-           </div>
+
+          {/* Existing accounts */}
+          <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '20px', overflow: 'hidden' }}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(44,95,45,0.1)' }}>
+              <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: 0 }}>Active Bank Accounts</p>
+            </div>
+            {loadingAccounts ? (
+              <div style={{ padding: '20px' }}><Skeleton count={3} height={56} /></div>
+            ) : accounts.length === 0 ? (
+              <p style={{ color: '#333', fontSize: '13px', padding: '20px', textAlign: 'center' }}>No accounts added yet</p>
+            ) : (
+              <div>
+                {accounts.map(acc => (
+                  <div key={acc.id} style={{ padding: '14px 20px', borderBottom: '1px solid rgba(255,255,255,0.04)', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <p style={{ color: '#fff', fontSize: '13px', fontWeight: 700, margin: '0 0 2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{acc.account_name}</p>
+                      <p style={{ color: '#555', fontSize: '11px', margin: 0 }}>{acc.bank_name} · <strong style={{ color: '#d4af37' }}>{acc.account_no}</strong> · <span style={{ color: '#2C5F2D' }}>{acc.category}</span></p>
+                    </div>
+                    <button onClick={() => deleteAccount(acc.id)} style={{ background: 'transparent', border: 'none', color: '#555', cursor: 'pointer', padding: '4px', flexShrink: 0 }}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Add new account */}
+          <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '20px', padding: '20px' }}>
+            <p style={{ color: '#2C5F2D', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 16px' }}>+ Add Bank Account</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div><label style={labelStyle}>Account Name</label><input value={newAccount.account_name} onChange={e => setNewAccount(p => ({ ...p, account_name: e.target.value }))} placeholder="e.g. Fruitbearers Church" style={fieldStyle} /></div>
+              <div><label style={labelStyle}>Account Number</label><input value={newAccount.account_no} onChange={e => setNewAccount(p => ({ ...p, account_no: e.target.value }))} placeholder="0000000000" style={fieldStyle} /></div>
+              <div><label style={labelStyle}>Bank Name</label><input value={newAccount.bank_name} onChange={e => setNewAccount(p => ({ ...p, bank_name: e.target.value }))} placeholder="e.g. Access Bank" style={fieldStyle} /></div>
+              <div>
+                <label style={labelStyle}>Category</label>
+                <select value={newAccount.category} onChange={e => setNewAccount(p => ({ ...p, category: e.target.value }))} style={fieldStyle}>
+                  {['Offering', 'Tithe', 'Seeds', 'Building', 'Missions'].map(c => <option key={c}>{c}</option>)}
+                </select>
+              </div>
+              <button
+                onClick={addAccount}
+                disabled={savingAccount}
+                style={{ width: '100%', padding: '12px', borderRadius: '12px', background: '#2C5F2D', border: 'none', color: '#fff', fontWeight: 700, fontSize: '13px', cursor: 'pointer', opacity: savingAccount ? 0.7 : 1 }}
+              >
+                {savingAccount ? 'Saving...' : 'Add Account'}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </PageWrap>
   )
 }
+
 
 // ── Email Draft Modal ──────────────────────────────────
 function EmailModal({ member, date, onClose }) {
@@ -1474,7 +1664,7 @@ function BirthdayTab() {
     const { data } = await supabase.from('profiles').select('*').eq('role', 'member')
     if (data) {
       const today = new Date()
-      const list = data.filter(m => {
+      const list = (data || []).filter(m => {
         if (!m.dob) return false
         const d = new Date(m.dob)
         if (filter === 'Today') {
@@ -1720,6 +1910,44 @@ function ThemesTab() {
         </div>
       }
     >
+      {/* ── COACHES PANEL (always visible) ── */}
+      <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '20px', padding: '20px', marginBottom: '28px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+          <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', margin: 0 }}>👨‍🏫 Coaches</p>
+          <p style={{ color: '#444', fontSize: '11px', margin: 0 }}>{coaches.length} coach{coaches.length !== 1 ? 'es' : ''}</p>
+        </div>
+        <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+          <input
+            value={coachForm.name}
+            onChange={e => setCoachForm({ ...coachForm, name: e.target.value })}
+            onKeyDown={e => e.key === 'Enter' && saveCoach()}
+            placeholder="Add a coach name..."
+            style={{ flex: 1, background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit' }}
+          />
+          <button onClick={saveCoach} style={{ padding: '10px 18px', borderRadius: '10px', background: '#2C5F2D', color: '#fff', fontWeight: 700, fontSize: '13px', border: 'none', cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap' }}>
+            + Add Coach
+          </button>
+        </div>
+        {coaches.length === 0 ? (
+          <p style={{ color: '#333', fontSize: '13px', textAlign: 'center', padding: '8px' }}>No coaches added yet. Add your first one above! ☝️</p>
+        ) : (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+            {coaches.map(c => (
+              <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#1a2e10', border: '1px solid rgba(44,95,45,0.25)', borderRadius: '100px', padding: '6px 12px 6px 10px' }}>
+                <div style={{ width: '24px', height: '24px', borderRadius: '50%', background: '#2C5F2D', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <span style={{ color: '#fff', fontSize: '11px', fontWeight: 800 }}>{c.name.charAt(0)}</span>
+                </div>
+                <span style={{ color: '#fff', fontSize: '13px', fontWeight: 600 }}>{c.name}</span>
+                <button onClick={() => deleteCoach(c.id)} style={{ background: 'transparent', border: 'none', color: '#ef444488', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}>
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── THEMES LIST ── */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
         {themes.map(theme => (
           <div key={theme.id} style={{ background: '#080c08', border: '1px solid rgba(44,95,45,0.4)', borderRadius: '20px', overflow: 'hidden' }}>
@@ -1874,3 +2102,180 @@ function ThemesTab() {
     </PageWrap>
   )
 }
+
+// ════════════════════════════════════
+// SOCIALS TAB
+// ════════════════════════════════════
+const SOCIAL_PLATFORMS = [
+  { id: 'YouTube',   emoji: '▶️',  hint: 'YouTube channel or Live link' },
+  { id: 'Instagram', emoji: '📸',  hint: 'Instagram page link' },
+  { id: 'Facebook',  emoji: '👥',  hint: 'Facebook page or group link' },
+  { id: 'WhatsApp',  emoji: '💬',  hint: 'WhatsApp group or chat link' },
+  { id: 'TikTok',    emoji: '🎵',  hint: 'TikTok page link' },
+  { id: 'Twitter',   emoji: '🐦',  hint: 'Twitter / X profile link' },
+  { id: 'Telegram',  emoji: '✈️',  hint: 'Telegram group or channel link' },
+  { id: 'Website',   emoji: '🌐',  hint: 'Main website or streaming link' },
+]
+
+function SocialsTab() {
+  const queryClient = useQueryClient()
+  const [form, setForm] = useState(() => {
+    const init = {}
+    SOCIAL_PLATFORMS.forEach(p => { init[p.id] = { url: '', is_active: false } })
+    return init
+  })
+  const [loaded, setLoaded] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  // Prayer link state
+  const [prayerLink, setPrayerLink] = useState('')
+  const [savingPrayer, setSavingPrayer] = useState(false)
+  const [prayerSaved, setPrayerSaved] = useState(false)
+
+  useEffect(() => {
+    supabase.from('church_socials').select('*').then(({ data }) => {
+      if (data && data.length > 0) {
+        setForm(prev => {
+          const next = { ...prev }
+          data.forEach(s => { next[s.platform] = { url: s.url || '', is_active: s.is_active || false } })
+          return next
+        })
+      }
+      setLoaded(true)
+    })
+    // Load prayer link
+    supabase.from('app_settings').select('value').eq('key', 'prayer_link').single()
+      .then(({ data }) => { if (data?.value) setPrayerLink(data.value) })
+  }, [])
+
+  const savePrayerLink = async () => {
+    setSavingPrayer(true)
+    await supabase.from('app_settings').upsert({ key: 'prayer_link', value: prayerLink })
+    setSavingPrayer(false)
+    setPrayerSaved(true)
+    setTimeout(() => setPrayerSaved(false), 3000)
+  }
+
+  const handleUpdate = (platform, field, value) => {
+    setForm(prev => ({ ...prev, [platform]: { ...prev[platform], [field]: value } }))
+  }
+
+  const saveSocials = async () => {
+    setSaving(true)
+    try {
+      const updates = SOCIAL_PLATFORMS.map(p => ({
+        platform: p.id,
+        url: form[p.id]?.url || '',
+        is_active: form[p.id]?.is_active || false,
+        order_number: SOCIAL_PLATFORMS.findIndex(x => x.id === p.id),
+      }))
+      const { error } = await supabase.from('church_socials').upsert(updates, { onConflict: 'platform' })
+      if (error) throw error
+      queryClient.invalidateQueries(['admin', 'socials'])
+      queryClient.invalidateQueries(['church_socials'])
+      toast.success('Socials updated! Members will see active links in the app. 🎉')
+    } catch (err) {
+      toast.error('Failed to save: ' + err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <PageWrap
+      title="Church Socials"
+      subtitle="Set links for each platform — only active ones with a URL show in the member app"
+      action={
+        <button
+          onClick={saveSocials}
+          disabled={saving || !loaded}
+          style={{ padding: '10px 24px', borderRadius: '12px', background: '#2C5F2D', border: 'none', color: '#fff', fontWeight: 800, fontSize: '14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}
+        >
+          {saving ? 'Saving...' : '💾 Save Settings'}
+        </button>
+      }
+    >
+      {!loaded ? (
+        <Skeleton count={8} height={100} />
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '16px' }}>
+          {SOCIAL_PLATFORMS.map(platform => {
+            const val = form[platform.id]
+            const hasUrl = !!val?.url?.trim()
+            return (
+              <div key={platform.id} style={{ background: '#0d160d', border: `1px solid ${val?.is_active && hasUrl ? 'rgba(44,95,45,0.5)' : 'rgba(44,95,45,0.15)'}`, borderRadius: '16px', padding: '20px', transition: 'border-color 0.2s' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <span style={{ fontSize: '24px' }}>{platform.emoji}</span>
+                    <p style={{ color: '#fff', fontSize: '15px', fontWeight: 700, margin: 0 }}>{platform.id}</p>
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                    <span style={{ color: val?.is_active ? '#2C5F2D' : '#444', fontSize: '11px', fontWeight: 800, textTransform: 'uppercase' }}>
+                      {val?.is_active ? 'Active' : 'Off'}
+                    </span>
+                    <div
+                      onClick={() => handleUpdate(platform.id, 'is_active', !val?.is_active)}
+                      style={{ width: '36px', height: '20px', borderRadius: '10px', background: val?.is_active ? '#2C5F2D' : '#333', position: 'relative', cursor: 'pointer', transition: 'background 0.2s' }}
+                    >
+                      <div style={{ position: 'absolute', top: '2px', left: val?.is_active ? '18px' : '2px', width: '16px', height: '16px', borderRadius: '50%', background: '#fff', transition: 'left 0.2s' }} />
+                    </div>
+                  </label>
+                </div>
+                <input
+                  type="url"
+                  placeholder={platform.hint}
+                  value={val?.url || ''}
+                  onChange={e => handleUpdate(platform.id, 'url', e.target.value)}
+                  style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.15)', borderRadius: '10px', padding: '10px 12px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }}
+                />
+                {val?.is_active && !hasUrl && (
+                  <p style={{ color: '#d4af37', fontSize: '11px', marginTop: '6px', margin: '6px 0 0' }}>⚠️ Add a URL to make this visible to members</p>
+                )}
+                {val?.is_active && hasUrl && (
+                  <p style={{ color: '#2C5F2D', fontSize: '11px', marginTop: '6px', margin: '6px 0 0' }}>✅ Showing in member app</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* ── ASK FOR PRAYER LINK ── */}
+      <div style={{ marginTop: '32px', background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '20px', padding: '28px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: '16px' }}>
+          <div style={{ width: '48px', height: '48px', borderRadius: '14px', background: 'rgba(44,95,45,0.12)', border: '1px solid rgba(44,95,45,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <span style={{ fontSize: '22px' }}>🤲</span>
+          </div>
+          <div>
+            <p style={{ color: '#fff', fontSize: '16px', fontWeight: 700, margin: '0 0 3px' }}>Ask for Prayer</p>
+            <p style={{ color: '#555', fontSize: '12px', margin: 0 }}>When members tap the "Ask for Prayer" card on their home screen, they are sent to this link</p>
+          </div>
+        </div>
+        <p style={{ color: '#444', fontSize: '12px', lineHeight: 1.5, marginBottom: '14px' }}>
+          This can be a WhatsApp link (<code style={{ color: '#2C5F2D', background: 'rgba(44,95,45,0.1)', padding: '1px 6px', borderRadius: '4px' }}>https://wa.me/234...</code>),
+          a Google Form, Typeform, or any URL you want.
+        </p>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <input
+            type="url"
+            value={prayerLink}
+            onChange={e => setPrayerLink(e.target.value)}
+            placeholder="https://wa.me/2348000000000"
+            style={{ flex: 1, background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '12px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit' }}
+          />
+          <button
+            onClick={savePrayerLink}
+            disabled={savingPrayer || !prayerLink.trim()}
+            style={{ padding: '12px 20px', borderRadius: '10px', background: prayerSaved ? '#1a2e1a' : '#2C5F2D', border: 'none', color: prayerSaved ? '#2C5F2D' : '#fff', fontWeight: 700, fontSize: '13px', cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap', transition: 'all 0.2s' }}
+          >
+            {savingPrayer ? 'Saving...' : prayerSaved ? '✅ Saved!' : 'Save Link'}
+          </button>
+        </div>
+        {prayerLink && (
+          <p style={{ color: '#2C5F2D', fontSize: '11px', marginTop: '10px', margin: '10px 0 0' }}>✅ Prayer card is active — members will be directed to this link</p>
+        )}
+      </div>
+    </PageWrap>
+  )
+}
+

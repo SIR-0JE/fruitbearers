@@ -61,6 +61,7 @@ export default function AccountScreen() {
         <section>
           <h3 className="text-white/20 text-[10px] font-black uppercase tracking-[0.2em] mb-6 px-4 shadow-sm">Account Settings</h3>
           <div className="bg-[#1a1a1a] rounded-[2rem] border border-white/5 overflow-hidden shadow-2xl transition-shadow hover:shadow-gold/5 active:scale-[0.99] transition-transform">
+            <AccountRow icon={<History size={18} />} color="bg-green-600" label="My Attendance" onClick={() => navigate('/history')} />
             <AccountRow icon={<Bell size={18} />} color="bg-blue-500" label="Notifications" />
             <AccountRow icon={<Settings size={18} />} color="bg-emerald-500" label="Preferences" />
             <AccountRow icon={<Lock size={18} />} color="bg-orange-500" label="Change Password" />
@@ -96,9 +97,9 @@ export default function AccountScreen() {
   )
 }
 
-function AccountRow({ icon, color, label, badge, border = true }) {
+function AccountRow({ icon, color, label, badge, border = true, onClick }) {
   return (
-    <div className={clsx(
+    <div onClick={onClick} className={clsx(
       "flex items-center justify-between p-5 active:bg-white/5 transition-all cursor-pointer group shadow-sm",
       border && "border-b border-white/5"
     )}>
