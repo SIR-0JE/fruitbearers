@@ -1379,7 +1379,7 @@ function GivingTab() {
   const [accounts, setAccounts] = useState([])
   const [loadingAccounts, setLoadingAccounts] = useState(true)
   const [savingAccount, setSavingAccount] = useState(false)
-  const [newAccount, setNewAccount] = useState({ account_name: '', account_no: '', bank_name: '', category: 'Offering', is_active: true })
+  const [newAccount, setNewAccount] = useState({ account_name: '', account_no: '', bank_name: '', is_active: true })
 
   const loadLogs = () => {
     supabase.from('giving').select('*, profile:user_id(full_name)').order('created_at', { ascending: false }).limit(20)
@@ -1394,23 +1394,31 @@ function GivingTab() {
 
   const addAccount = async () => {
     if (!newAccount.account_name || !newAccount.account_no || !newAccount.bank_name) {
-      alert('Please fill in all account fields'); return
+      toast.error('Please fill in all three account fields')
+      return
     }
     setSavingAccount(true)
-    const { error } = await supabase.from('giving_accounts').insert(newAccount)
+    const { error } = await supabase.from('giving_accounts').insert({
+      account_name: newAccount.account_name,
+      account_no: newAccount.account_no,
+      bank_name: newAccount.bank_name,
+      is_active: true,
+    })
     if (!error) {
-      setNewAccount({ account_name: '', account_no: '', bank_name: '', category: 'Offering', is_active: true })
+      toast.success('Account added!')
+      setNewAccount({ account_name: '', account_no: '', bank_name: '', is_active: true })
       loadAccounts()
     } else {
-      alert('Error: ' + error.message)
+      toast.error('Error: ' + error.message)
     }
     setSavingAccount(false)
   }
 
   const deleteAccount = async (id) => {
-    if (!confirm('Remove this account?')) return
-    await supabase.from('giving_accounts').delete().eq('id', id)
-    loadAccounts()
+    if (!confirm('Remove this account? This cannot be undone.')) return
+    const { error } = await supabase.from('giving_accounts').delete().eq('id', id)
+    if (!error) { toast.success('Account removed'); loadAccounts() }
+    else toast.error('Delete failed: ' + error.message)
   }
 
   const fieldStyle = { width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '10px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }
@@ -1470,11 +1478,14 @@ function GivingTab() {
                 {accounts.map(acc => (
                   <div key={acc.id} style={{ padding: '14px 20px', borderBottom: '1px solid rgba(255,255,255,0.04)', display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <p style={{ color: '#fff', fontSize: '13px', fontWeight: 700, margin: '0 0 2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{acc.account_name}</p>
-                      <p style={{ color: '#555', fontSize: '11px', margin: 0 }}>{acc.bank_name} · <strong style={{ color: '#d4af37' }}>{acc.account_no}</strong> · <span style={{ color: '#2C5F2D' }}>{acc.category}</span></p>
+                      <p style={{ color: '#fff', fontSize: '13px', fontWeight: 700, margin: '0 0 3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{acc.account_name}</p>
+                      <p style={{ color: '#555', fontSize: '11px', margin: 0 }}>{acc.bank_name} · <strong style={{ color: '#d4af37' }}>{acc.account_no}</strong></p>
                     </div>
-                    <button onClick={() => deleteAccount(acc.id)} style={{ background: 'transparent', border: 'none', color: '#555', cursor: 'pointer', padding: '4px', flexShrink: 0 }}>
-                      <Trash2 size={14} />
+                    <button
+                      onClick={() => deleteAccount(acc.id)}
+                      style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.15)', borderRadius: '8px', color: '#ef4444', cursor: 'pointer', padding: '7px 10px', flexShrink: 0, display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px', fontWeight: 700 }}
+                    >
+                      <Trash2 size={13} /> Delete
                     </button>
                   </div>
                 ))}
@@ -1489,18 +1500,12 @@ function GivingTab() {
               <div><label style={labelStyle}>Account Name</label><input value={newAccount.account_name} onChange={e => setNewAccount(p => ({ ...p, account_name: e.target.value }))} placeholder="e.g. Fruitbearers Church" style={fieldStyle} /></div>
               <div><label style={labelStyle}>Account Number</label><input value={newAccount.account_no} onChange={e => setNewAccount(p => ({ ...p, account_no: e.target.value }))} placeholder="0000000000" style={fieldStyle} /></div>
               <div><label style={labelStyle}>Bank Name</label><input value={newAccount.bank_name} onChange={e => setNewAccount(p => ({ ...p, bank_name: e.target.value }))} placeholder="e.g. Access Bank" style={fieldStyle} /></div>
-              <div>
-                <label style={labelStyle}>Category</label>
-                <select value={newAccount.category} onChange={e => setNewAccount(p => ({ ...p, category: e.target.value }))} style={fieldStyle}>
-                  {['Offering', 'Tithe', 'Seeds', 'Building', 'Missions'].map(c => <option key={c}>{c}</option>)}
-                </select>
-              </div>
               <button
                 onClick={addAccount}
                 disabled={savingAccount}
-                style={{ width: '100%', padding: '12px', borderRadius: '12px', background: '#2C5F2D', border: 'none', color: '#fff', fontWeight: 700, fontSize: '13px', cursor: 'pointer', opacity: savingAccount ? 0.7 : 1 }}
+                style={{ width: '100%', padding: '13px', borderRadius: '12px', background: '#2C5F2D', border: 'none', color: '#fff', fontWeight: 700, fontSize: '14px', cursor: savingAccount ? 'not-allowed' : 'pointer', opacity: savingAccount ? 0.7 : 1, marginTop: '4px' }}
               >
-                {savingAccount ? 'Saving...' : 'Add Account'}
+                {savingAccount ? 'Saving...' : '+ Add Account'}
               </button>
             </div>
           </div>
