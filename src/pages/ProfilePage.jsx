@@ -18,7 +18,6 @@ export default function ProfilePage() {
   
   const [formData, setFormData] = useState({
     full_name: profile?.full_name || '',
-    wisdom_house: profile?.wisdom_house || '',
     dob: profile?.dob || '',
     phone: profile?.phone || '',
     avatar_url: profile?.avatar_url || ''
@@ -29,7 +28,6 @@ export default function ProfilePage() {
     if (profile) {
       setFormData({
         full_name: profile.full_name || '',
-        wisdom_house: profile.wisdom_house || '',
         dob: profile.dob || '',
         phone: profile.phone || '',
         avatar_url: profile.avatar_url || ''
@@ -60,7 +58,6 @@ export default function ProfilePage() {
       .upsert({ 
         id: targetId,
         full_name: formData.full_name,
-        wisdom_house: formData.wisdom_house,
         dob: formData.dob || null,
         phone: formData.phone,
         avatar_url: formData.avatar_url,
@@ -199,19 +196,7 @@ export default function ProfilePage() {
               </InputGroup>
             </div>
 
-            <InputGroup label="Wisdom House" icon={<Home size={18} />}>
-              <select 
-                name="wisdom_house" className="profile-input" 
-                value={formData.wisdom_house} onChange={handleChange}
-                style={{ appearance: 'none', background: '#1a1a1a' }}
-              >
-                <option value="">Choose your house</option>
-                <option value="House of Faith">House of Faith</option>
-                <option value="House of Grace">House of Grace</option>
-                <option value="House of Peace">House of Peace</option>
-                <option value="House of Joy">House of Joy</option>
-              </select>
-            </InputGroup>
+
           </div>
 
           <button 

@@ -622,7 +622,7 @@ function AttendanceTab() {
   const [emailTarget, setEmailTarget] = useState(null)
   
   const [showCreate, setShowCreate] = useState(false)
-  const [newSession, setNewSession] = useState({ name: 'Sunday Service', type: 'First Service', end_time: '' })
+  const [newSession, setNewSession] = useState({ name: 'Attendance Session', type: 'Sunday Service', end_time: '' })
   const [activeSession, setActiveSession] = useState(null)
   const [isCreating, setIsCreating] = useState(false)
 
@@ -846,19 +846,7 @@ function AttendanceTab() {
                </div>
                
                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                 <div>
-                   <label style={{ display: 'block', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px' }}>Service Type</label>
-                   <select 
-                     value={newSession.type}
-                     onChange={e => setNewSession(p => ({ ...p, type: e.target.value }))}
-                     style={{ width: '100%', background: '#070d07', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '14px', color: '#fff', outline: 'none', fontSize: '15px' }}
-                   >
-                     <option>First Service</option>
-                     <option>Second Service</option>
-                     <option>Midweek Service</option>
-                     <option>Special Service</option>
-                   </select>
-                 </div>
+
 
                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
                     <div>
@@ -1033,9 +1021,8 @@ function MembersTab() {
     const term = search.toLowerCase()
     const nameMatch = m.full_name?.toLowerCase().includes(term)
     const emailMatch = m.email?.toLowerCase().includes(term)
-    const houseMatch = m.wisdom_house?.toLowerCase().includes(term)
     const dobMatch = m.dob && new Date(m.dob).toLocaleString('default', { month: 'long' }).toLowerCase().includes(term)
-    return nameMatch || emailMatch || houseMatch || dobMatch
+    return nameMatch || emailMatch || dobMatch
   })
 
   // Role toggling is now handled inside UserProfileModal
@@ -1046,7 +1033,7 @@ function MembersTab() {
         <input
           value={search}
           onChange={e => setSearch(e.target.value)}
-          placeholder="Filter by name, email, wisdom house, or birth month..."
+          placeholder="Filter by name, email, or birth month..."
           style={{ width: '100%', maxWidth: '400px', background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '11px 16px', color: '#fff', fontSize: '14px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }}
         />
       </div>
@@ -1056,14 +1043,14 @@ function MembersTab() {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid rgba(44,95,45,0.15)' }}>
-              {['Member', 'Email', 'Date of Birth', 'House'].map(h => (
+              {['Member', 'Email', 'Date of Birth'].map(h => (
                 <th key={h} style={{ padding: '14px 20px', color: '#555', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', textAlign: 'left' }}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={4} style={{ padding: '20px' }}><Skeleton count={10} height={40} /></td></tr>
+              <tr><td colSpan={3} style={{ padding: '20px' }}><Skeleton count={10} height={40} /></td></tr>
             ) : filtered.map(m => (
               <tr key={m.id} onClick={() => setSelectedMember(m)} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)', cursor: 'pointer', transition: 'background 0.2s' }} onMouseOver={e => e.currentTarget.style.background='rgba(44,95,45,0.1)'} onMouseOut={e => e.currentTarget.style.background='transparent'}>
                 <td style={{ padding: '14px 20px' }}>
@@ -1076,9 +1063,6 @@ function MembersTab() {
                 </td>
                 <td style={{ padding: '14px 20px', color: '#666', fontSize: '13px' }}>{m.email}</td>
                 <td style={{ padding: '14px 20px', color: '#888', fontSize: '13px' }}>{m.dob ? new Date(m.dob).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'}</td>
-                <td style={{ padding: '14px 20px' }}>
-                  <span style={{ color: '#d4af37', fontSize: '13px', fontWeight: 700 }}>{m.wisdom_house || '—'}</span>
-                </td>
               </tr>
             ))}
           </tbody>
@@ -1556,6 +1540,7 @@ function EmailModal({ member, date, onClose }) {
 
 // ── User Profile Detail Modal ────────────────────────────
 function UserProfileModal({ member: initialMember, onClose }) {
+  const queryClient = useQueryClient()
   const [member, setMember] = useState(initialMember)
 
   const toggleRole = async () => {
@@ -1564,8 +1549,29 @@ function UserProfileModal({ member: initialMember, onClose }) {
     const { error } = await supabase.from('profiles').update({ role: newRole }).eq('id', member.id)
     if (!error) {
       setMember(prev => ({ ...prev, role: newRole }))
+      toast.success('Role updated')
     } else {
-      alert('Failed to update role: ' + error.message)
+      toast.error('Failed to update role: ' + error.message)
+    }
+  }
+
+  const handleDeleteUser = async () => {
+    const confirmed = confirm(`CRITICAL: Are you sure you want to delete ${member.full_name}'s account? This will remove all their records. This cannot be undone.`)
+    if (!confirmed) return
+
+    try {
+      // Delete the profile - RLS or DB trigger should handle cleanup
+      const { error } = await supabase.from('profiles').delete().eq('id', member.id)
+      if (error) throw error
+      
+      // Refresh the data!
+      queryClient.invalidateQueries({ queryKey: ['admin', 'members'] })
+      queryClient.invalidateQueries({ queryKey: ['admin', 'stats'] })
+
+      toast.success('Member profile deleted successfully')
+      onClose()
+    } catch (err) {
+      toast.error('Failed to delete user: ' + err.message)
     }
   }
 
@@ -1635,9 +1641,17 @@ function UserProfileModal({ member: initialMember, onClose }) {
            <DetailRow icon={<Mail size={16} />} label="Email Address" value={member.email} />
            <DetailRow icon={<PhoneOutgoing size={16} />} label="Phone Number" value={member.phone || 'Not provided'} />
            <DetailRow icon={<Calendar size={16} />} label="Date of Birth" value={member.dob ? new Date(member.dob).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : 'Not provided'} />
-           <DetailRow icon={<Heart size={16} />} label="Wisdom House" value={member.wisdom_house || 'Not assigned'} />
            <DetailRow icon={<TrendingUp size={16} />} label="Attendance Streak" value={`🔥 ${member.attendance_streak || 0} consecutive Sundays`} />
         </div>
+
+        <button 
+           onClick={handleDeleteUser}
+           style={{ width: '100%', marginTop: '20px', padding: '14px', borderRadius: '12px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444', fontWeight: 700, fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', transition: 'all 0.2s' }}
+           onMouseEnter={e => e.currentTarget.style.background='rgba(239,68,68,0.2)'}
+           onMouseLeave={e => e.currentTarget.style.background='rgba(239,68,68,0.1)'}
+        >
+           <Trash2 size={14} /> Delete Member Account
+        </button>
       </motion.div>
     </div>
   )
@@ -1822,64 +1836,110 @@ function ThemesTab() {
   // --- Theme CRUD ---
   const saveTheme = async () => {
     if (!themeForm.name) return
-    if (themeForm.id) {
-      await supabase.from('themes').update({ name: themeForm.name }).eq('id', themeForm.id)
-    } else {
-      await supabase.from('themes').insert({ name: themeForm.name })
+    try {
+      if (themeForm.id) {
+        const { error } = await supabase.from('themes').update({ name: themeForm.name }).eq('id', themeForm.id)
+        if (error) throw error
+      } else {
+        const { error } = await supabase.from('themes').insert({ name: themeForm.name })
+        if (error) throw error
+      }
+      toast.success('Theme saved successfully! 🎉')
+      setShowThemeModal(false)
+      load()
+    } catch (err) {
+      toast.error('Failed to save theme: ' + err.message)
     }
-    setShowThemeModal(false)
-    load()
   }
   const deleteTheme = async (id) => {
     if (!confirm('Delete this entire Theme and ALL its modules and topics?')) return
-    await supabase.from('themes').delete().eq('id', id)
-    load()
+    try {
+      const { error } = await supabase.from('themes').delete().eq('id', id)
+      if (error) throw error
+      toast.success('Theme deleted.')
+      load()
+    } catch (err) {
+      toast.error('Delete failed: ' + err.message)
+    }
   }
 
   // --- Module CRUD ---
   const saveModule = async () => {
     if (!modForm.title || !modForm.theme_id) return
-    if (modForm.id) {
-      await supabase.from('modules').update({ title: modForm.title, order_number: modForm.order_number }).eq('id', modForm.id)
-    } else {
-      await supabase.from('modules').insert({ theme_id: modForm.theme_id, title: modForm.title, order_number: modForm.order_number })
+    try {
+      if (modForm.id) {
+        const { error } = await supabase.from('modules').update({ title: modForm.title, order_number: modForm.order_number }).eq('id', modForm.id)
+        if (error) throw error
+      } else {
+        const { error } = await supabase.from('modules').insert({ theme_id: modForm.theme_id, title: modForm.title, order_number: modForm.order_number })
+        if (error) throw error
+      }
+      toast.success('Module saved! 📦')
+      setShowModModal(false)
+      load()
+    } catch (err) {
+      toast.error('Failed to save module: ' + err.message)
     }
-    setShowModModal(false)
-    load()
   }
   const deleteModule = async (id) => {
     if (!confirm('Delete this module and ALL its topics?')) return
-    await supabase.from('modules').delete().eq('id', id)
-    load()
+    try {
+      const { error } = await supabase.from('modules').delete().eq('id', id)
+      if (error) throw error
+      toast.success('Module removed.')
+      load()
+    } catch (err) {
+      toast.error('Delete failed: ' + err.message)
+    }
   }
 
   // --- Topic CRUD ---
   const saveTopic = async () => {
     if (!topicForm.title || !topicForm.module_id) return
-    if (topicForm.id) {
-      await supabase.from('topics').update({ title: topicForm.title, order_number: topicForm.order_number }).eq('id', topicForm.id)
-    } else {
-      await supabase.from('topics').insert({ module_id: topicForm.module_id, title: topicForm.title, order_number: topicForm.order_number })
+    try {
+      if (topicForm.id) {
+        const { error } = await supabase.from('topics').update({ title: topicForm.title, order_number: topicForm.order_number }).eq('id', topicForm.id)
+        if (error) throw error
+      } else {
+        const { error } = await supabase.from('topics').insert({ module_id: topicForm.module_id, title: topicForm.title, order_number: topicForm.order_number })
+        if (error) throw error
+      }
+      toast.success('Topic saved! 📚')
+      setShowTopicModal(false)
+      load()
+    } catch (err) {
+      toast.error('Failed to save topic: ' + err.message)
     }
-    setShowTopicModal(false)
-    load()
   }
 
   // --- Coach CRUD ---
   const saveCoach = async () => {
     if (!coachForm.name) return
-    if (coachForm.id) {
-      await supabase.from('coaches').update({ name: coachForm.name }).eq('id', coachForm.id)
-    } else {
-      await supabase.from('coaches').insert({ name: coachForm.name })
+    try {
+      if (coachForm.id) {
+        const { error } = await supabase.from('coaches').update({ name: coachForm.name }).eq('id', coachForm.id)
+        if (error) throw error
+      } else {
+        const { error } = await supabase.from('coaches').insert({ name: coachForm.name })
+        if (error) throw error
+      }
+      toast.success(`Coach "${coachForm.name}" added! 👨‍🏫`)
+      setCoachForm({ id: null, name: '' })
+      load()
+    } catch (err) {
+      toast.error('Failed to save coach: ' + err.message)
     }
-    setCoachForm({ id: null, name: '' })
-    load()
   }
   const deleteCoach = async (id) => {
     if (!confirm('Delete this coach completely?')) return
-    await supabase.from('coaches').delete().eq('id', id)
-    load()
+    try {
+      const { error } = await supabase.from('coaches').delete().eq('id', id)
+      if (error) throw error
+      toast.success('Coach removed.')
+      load()
+    } catch (err) {
+      toast.error('Delete failed: ' + err.message)
+    }
   }
   const deleteTopic = async (id) => {
     if (!confirm('Delete this topic?')) return
