@@ -661,6 +661,7 @@ function AttendanceTab() {
   const [newSession, setNewSession] = useState({ name: 'Attendance Session', type: 'Sunday Service', end_time: '23:59' })
   const [activeSession, setActiveSession] = useState(null)
   const [isCreating, setIsCreating] = useState(false)
+  const [confirmDeactivateId, setConfirmDeactivateId] = useState(null)
 
   // Curriculum attachment (optional)
   const [selectedModuleId, setSelectedModuleId] = useState('')
@@ -741,7 +742,14 @@ function AttendanceTab() {
   }
 
   const deactivateSession = async (sessionId) => {
-    if (!confirm('Deactivate this session? Members will no longer be able to check in.')) return
+    if (confirmDeactivateId !== sessionId) {
+      // First tap: enter confirmation mode, auto-reset after 4 seconds
+      setConfirmDeactivateId(sessionId)
+      setTimeout(() => setConfirmDeactivateId(null), 4000)
+      return
+    }
+    // Second tap: actually deactivate
+    setConfirmDeactivateId(null)
     const { error } = await supabase
       .from('attendance_sessions')
       .update({ is_active: false })
@@ -749,7 +757,7 @@ function AttendanceTab() {
     if (!error) {
       queryClient.invalidateQueries(['admin', 'attendance', date])
       if (activeSession?.id === sessionId) setActiveSession(null)
-      toast.success('Session deactivated')
+      toast.success('Session deactivated — members can no longer check in')
     } else {
       toast.error('Failed to deactivate: ' + error.message)
     }
@@ -827,9 +835,17 @@ function AttendanceTab() {
             {s.is_active && (
               <button
                 onClick={(e) => { e.stopPropagation(); deactivateSession(s.id) }}
-                style={{ marginTop: '10px', width: '100%', padding: '6px', borderRadius: '8px', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444', fontSize: '10px', fontWeight: 800, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.05em' }}
+                style={{
+                  marginTop: '10px', width: '100%', padding: '6px',
+                  borderRadius: '8px', fontSize: '10px', fontWeight: 800,
+                  cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.05em',
+                  transition: 'all 0.2s',
+                  background: confirmDeactivateId === s.id ? 'rgba(239,68,68,0.25)' : 'rgba(239,68,68,0.08)',
+                  border: confirmDeactivateId === s.id ? '1px solid rgba(239,68,68,0.6)' : '1px solid rgba(239,68,68,0.2)',
+                  color: '#ef4444',
+                }}
               >
-                Deactivate
+                {confirmDeactivateId === s.id ? '⚠️ Tap again to confirm' : 'Deactivate'}
               </button>
             )}
           </div>
