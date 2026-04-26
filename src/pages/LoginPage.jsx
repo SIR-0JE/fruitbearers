@@ -20,7 +20,10 @@ export default function LoginPage() {
       toast.error(error.message)
     } else {
       toast.success('Welcome back!')
-      navigate('/')
+      // Honour ?redirect so QR check-in links survive the login flow
+      const params = new URLSearchParams(window.location.search)
+      const redirect = params.get('redirect')
+      navigate(redirect || '/')
     }
     setLoading(false)
   }

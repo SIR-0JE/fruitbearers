@@ -44,14 +44,10 @@ export default function CheckInPage() {
 
     setSession(sess)
 
-    // Upsert attendance record (unique on user_id + session_id)
-    const { error: insertErr, data } = await supabase
+    // Insert record — if duplicate, 23505 fires and we show "already" screen
+    const { error: insertErr } = await supabase
       .from('attendance_records')
-      .upsert(
-        { user_id: user.id, session_id: sessionId },
-        { onConflict: 'user_id,session_id', ignoreDuplicates: false }
-      )
-      .select()
+      .insert({ user_id: user.id, session_id: sessionId })
 
     if (insertErr) {
       if (insertErr.code === '23505') {

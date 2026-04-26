@@ -20,6 +20,13 @@ export default function ScannerPage() {
   const [pin, setPin]               = useState('')
   const [loading, setLoading]       = useState(false)
 
+  // Coach picker state (shown after successful PIN check-in when session has a topic)
+  const [attendanceRecordId, setAttendanceRecordId] = useState(null)
+  const [sessionInfo, setSessionInfo]               = useState(null)
+  const [coachList, setCoachList]                   = useState([])
+  const [selectedCoach, setSelectedCoach]           = useState(null)
+  const [submittingCoach, setSubmittingCoach]       = useState(false)
+
   const videoRef  = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
@@ -76,6 +83,17 @@ export default function ScannerPage() {
   const handleQRCode = async (data) => {
     stopCamera()
     setScannedCode(data)
+    // QR codes now encode the full check-in URL — navigate directly to CheckInPage
+    try {
+      const url = new URL(data)
+      const match = url.pathname.match(/\/check-in\/(.+)/)
+      if (match) {
+        navigate(`/check-in/${match[1]}`)
+        return
+      }
+    } catch (_) {
+      // Not a URL — fall through to legacy UUID lookup
+    }
     verifyAndCheckIn(data, 'qr')
   }
 
@@ -88,45 +106,74 @@ export default function ScannerPage() {
     setLoading(true)
 
     const today = new Date().toISOString().split('T')[0]
-    const query = supabase.from('attendance_sessions').select('*')
-    
-    if (method === 'qr') query.eq('qr_code_value', codeValue)
-    else query.eq('pin', codeValue).eq('service_date', today)
+    let sessionQuery = supabase.from('attendance_sessions').select('*, topics(title)')
+    if (method === 'qr') sessionQuery = sessionQuery.eq('qr_code_value', codeValue)
+    else sessionQuery = sessionQuery.eq('pin', codeValue).eq('service_date', today)
 
-    const { data: session, error: sErr } = await query.single()
+    const { data: session, error: sErr } = await sessionQuery.single()
 
     if (sErr || !session) {
+      setCheckInResult({ success: false, message: method === 'qr' ? 'Invalid QR Code' : `PIN "${codeValue}" not found for today` })
       setPhase('success')
-      setCheckInResult({ success: false, message: method === 'qr' ? 'Invalid QR Code' : `PIN "${codeValue}" not found for Today` })
       setLoading(false)
       return
     }
 
-    // Check session is still active (timezone-safe, admin-controlled)
     if (!session.is_active) {
-      setPhase('success')
       setCheckInResult({ success: false, message: 'This session is no longer active. Ask your coordinator for a new PIN.' })
+      setPhase('success')
       setLoading(false)
       return
     }
 
     if (profile?.id) {
-      const { error } = await supabase.from('attendance_records').insert({ user_id: profile.id, session_id: session.id })
+      // Use insert (not upsert) so 23505 duplicate error fires correctly
+      const { data: record, error } = await supabase
+        .from('attendance_records')
+        .insert({ user_id: profile.id, session_id: session.id })
+        .select().single()
+
       if (!error) {
         let newStreak = profile.attendance_streak || 0
         if (!profile.last_checkin) newStreak = 1
         else if (profile.last_checkin !== today) {
-          const diff = Math.floor((new Date() - new Date(profile.last_checkin)) / (1000*60*60*24))
+          const diff = Math.floor((new Date() - new Date(profile.last_checkin)) / (1000 * 60 * 60 * 24))
           newStreak = diff <= 8 ? newStreak + 1 : 1
         }
         await supabase.from('profiles').update({ attendance_streak: newStreak, last_checkin: today }).eq('id', profile.id)
         setCheckInResult({ success: true, streak: newStreak })
+
+        // If session has a topic, show coach picker before success
+        if (session.topic_id && record?.id) {
+          const { data: coachData } = await supabase.from('coaches').select('*').eq('is_active', true).order('name')
+          setAttendanceRecordId(record.id)
+          setSessionInfo(session)
+          setCoachList(coachData || [])
+          setSelectedCoach(null)
+          setLoading(false)
+          setPhase('coach')
+          return
+        }
       } else {
-        setCheckInResult({ success: false, message: error.code === '23505' ? 'Already checked in' : error.message })
+        setCheckInResult({ success: false, message: error.code === '23505' ? 'Already checked in for this session! 👋' : error.message })
       }
     }
     setPhase('success')
     setLoading(false)
+  }
+
+  const handleSubmitCoach = async () => {
+    if (!selectedCoach || !attendanceRecordId || !sessionInfo?.id) return
+    setSubmittingCoach(true)
+    await supabase.from('topic_attendance').insert({
+      user_id: profile.id,
+      topic_id: sessionInfo.topic_id,
+      coach_id: selectedCoach,
+      attendance_id: attendanceRecordId,
+      session_id: sessionInfo.id,
+    })
+    setSubmittingCoach(false)
+    setPhase('success')
   }
 
   const stopCamera = () => {
@@ -187,6 +234,31 @@ export default function ScannerPage() {
             </div>
             <div style={{ padding: '24px 0' }}>
               <button onClick={() => verifyAndCheckIn(pin, 'pin')} disabled={pin.length < 4 || loading} style={{ width: '100%', padding: '20px', borderRadius: '100px', background: pin.length === 4 ? '#2C5F2D' : 'rgba(255,255,255,0.05)', color: '#fff', fontWeight: 900, border: 'none' }}>{loading ? 'Verifying...' : 'Check In Now'}</button>
+            </div>
+          </motion.div>
+        )}
+
+        {phase === 'coach' && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} style={{ position: 'fixed', inset: 0, background: '#070d07', display: 'flex', flexDirection: 'column', padding: '24px 20px', zIndex: 110 }}>
+            <div style={{ padding: '52px 0 24px', textAlign: 'center' }}>
+              <h2 style={{ color: '#fff', fontSize: '20px', fontWeight: 800, margin: '0 0 6px' }}>Who is your coach? 👨‍🏫</h2>
+              <p style={{ color: '#555', fontSize: '13px', margin: 0 }}>Select the coach for today's session</p>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              {coachList.map(c => (
+                <button key={c.id} onClick={() => setSelectedCoach(c.id)}
+                  style={{ padding: '18px 20px', borderRadius: '16px', textAlign: 'left', background: selectedCoach === c.id ? '#1a2e10' : 'rgba(255,255,255,0.03)', border: `1.5px solid ${selectedCoach === c.id ? '#2C5F2D' : 'rgba(255,255,255,0.08)'}`, color: '#fff', fontSize: '15px', fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}>
+                  {selectedCoach === c.id ? '✅ ' : ''}{c.name}
+                </button>
+              ))}
+              {coachList.length === 0 && <p style={{ color: '#555', textAlign: 'center', marginTop: '40px' }}>No coaches available right now.</p>}
+            </div>
+            <div style={{ paddingTop: '20px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <button onClick={handleSubmitCoach} disabled={!selectedCoach || submittingCoach}
+                style={{ width: '100%', padding: '20px', borderRadius: '100px', background: selectedCoach ? '#2C5F2D' : 'rgba(255,255,255,0.05)', color: '#fff', fontWeight: 900, border: 'none', cursor: selectedCoach ? 'pointer' : 'default' }}>
+                {submittingCoach ? 'Saving...' : 'Confirm Coach'}
+              </button>
+              <button onClick={() => setPhase('success')} style={{ background: 'transparent', border: 'none', color: '#555', fontSize: '13px', cursor: 'pointer', padding: '8px' }}>Skip for now</button>
             </div>
           </motion.div>
         )}
