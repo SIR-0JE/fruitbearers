@@ -124,9 +124,9 @@ export default function HomeScreen() {
 
     const targetSession = sessions[0]
 
-    // 2. Check expiry
-    if (new Date(targetSession.expires_at) < new Date()) {
-      setCheckInError('This session has expired')
+    // 2. Check session is still active (admin-controlled, timezone-safe)
+    if (!targetSession.is_active) {
+      setCheckInError('This session is no longer active. Ask your coordinator for a new PIN.')
       setCheckingPin(false)
       return
     }

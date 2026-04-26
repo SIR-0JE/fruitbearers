@@ -449,24 +449,60 @@ function HomePageTab() {
     setPreviewUrl(URL.createObjectURL(file))
   }
 
-  // Optimize large phone pictures before uploading
+  // Compress image before uploading. Includes full error handling so the
+  // promise never hangs silently (which caused the "stuck uploading" bug).
   const compressImage = (file) => {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.src = URL.createObjectURL(file);
+    return new Promise((resolve, reject) => {
+      // Safety timeout — if the browser can't process the canvas in 15s, skip compression
+      const timeout = setTimeout(() => {
+        console.warn('compressImage timed out — uploading original file')
+        resolve(file)
+      }, 15000)
+
+      const objectUrl = URL.createObjectURL(file)
+      const img = new Image()
+
+      img.onerror = () => {
+        clearTimeout(timeout)
+        URL.revokeObjectURL(objectUrl)
+        // Fall back to original file instead of rejecting so upload still works
+        console.warn('compressImage: image failed to load — uploading original')
+        resolve(file)
+      }
+
       img.onload = () => {
-        const canvas = document.createElement('canvas');
-        // Cap width at 1200px to maintain quality while massively shrinking file size
-        const scaleSize = img.width > 1200 ? 1200 / img.width : 1;
-        canvas.width = img.width * scaleSize;
-        canvas.height = img.height * scaleSize;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        canvas.toBlob((blob) => {
-          resolve(new File([blob], file.name.replace(/\.[^/.]+$/, ".jpg"), { type: 'image/jpeg', lastModified: Date.now() }));
-        }, 'image/jpeg', 0.8); // 80% quality JPEG
-      };
-    });
+        clearTimeout(timeout)
+        URL.revokeObjectURL(objectUrl)
+        try {
+          const canvas = document.createElement('canvas')
+          // Cap width at 1200px to keep file size manageable
+          const scaleSize = img.width > 1200 ? 1200 / img.width : 1
+          canvas.width = Math.round(img.width * scaleSize)
+          canvas.height = Math.round(img.height * scaleSize)
+          const ctx = canvas.getContext('2d')
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+          canvas.toBlob((blob) => {
+            if (!blob) {
+              // toBlob returned null — fall back to original
+              console.warn('compressImage: toBlob returned null — uploading original')
+              resolve(file)
+              return
+            }
+            const compressed = new File(
+              [blob],
+              file.name.replace(/\.[^/.]+$/, '.jpg'),
+              { type: 'image/jpeg', lastModified: Date.now() }
+            )
+            resolve(compressed)
+          }, 'image/jpeg', 0.82)
+        } catch (e) {
+          console.warn('compressImage canvas error — uploading original:', e)
+          resolve(file) // always resolve so the upload continues
+        }
+      }
+
+      img.src = objectUrl
+    })
   }
 
   const confirmUpload = async () => {
@@ -622,7 +658,7 @@ function AttendanceTab() {
   const [emailTarget, setEmailTarget] = useState(null)
   
   const [showCreate, setShowCreate] = useState(false)
-  const [newSession, setNewSession] = useState({ name: 'Attendance Session', type: 'Sunday Service', end_time: '' })
+  const [newSession, setNewSession] = useState({ name: 'Attendance Session', type: 'Sunday Service', end_time: '23:59' })
   const [activeSession, setActiveSession] = useState(null)
   const [isCreating, setIsCreating] = useState(false)
 
@@ -658,17 +694,27 @@ function AttendanceTab() {
   const { members = [], sessions = [], checkins = [] } = attendanceData
 
   const createSession = async () => {
-    if (!newSession.end_time) {
-      alert('Please set an end time for the session.')
-      return
-    }
-
     setIsCreating(true)
     const pin = Math.floor(1000 + Math.random() * 9000).toString()
     const qrValue = crypto.randomUUID()
     
-    // Combine date + end_time
-    const expiresAt = new Date(`${date}T${newSession.end_time}`).toISOString()
+    // Build expires_at: combine the service date with the end_time.
+    // We use UTC midnight of the NEXT day as a safe fallback so the session
+    // lasts all day regardless of the admin's local timezone.
+    const endTime = newSession.end_time || '23:59'
+    // Parse as UTC by appending 'Z' only after converting the local HH:MM to
+    // a proper UTC offset. Simplest correct approach: interpret date+time as
+    // local, let JS convert to UTC via toISOString().
+    const [hours, minutes] = endTime.split(':').map(Number)
+    const expiryDate = new Date(date) // midnight UTC of service date
+    expiryDate.setUTCHours(23, 59, 59, 999) // always expire at 23:59 UTC (end of day)
+    // If admin set a specific early end time, honour it but add a 1-hour buffer
+    // so timezone differences don't cause immediate expiry.
+    if (endTime !== '23:59') {
+      // Store: service date midnight UTC + end hours + 1 hour grace buffer
+      expiryDate.setUTCHours(hours + 1, minutes, 0, 0)
+    }
+    const expiresAt = expiryDate.toISOString()
 
     const { data, error } = await supabase.from('attendance_sessions').insert({
       session_name: newSession.name,
@@ -692,6 +738,21 @@ function AttendanceTab() {
       alert('Error creating session: ' + error.message)
     }
     setIsCreating(false)
+  }
+
+  const deactivateSession = async (sessionId) => {
+    if (!confirm('Deactivate this session? Members will no longer be able to check in.')) return
+    const { error } = await supabase
+      .from('attendance_sessions')
+      .update({ is_active: false })
+      .eq('id', sessionId)
+    if (!error) {
+      queryClient.invalidateQueries(['admin', 'attendance', date])
+      if (activeSession?.id === sessionId) setActiveSession(null)
+      toast.success('Session deactivated')
+    } else {
+      toast.error('Failed to deactivate: ' + error.message)
+    }
   }
 
   const downloadQR = () => {
@@ -747,18 +808,30 @@ function AttendanceTab() {
         {sessions.map(s => (
           <div 
             key={s.id} 
-            onClick={() => setActiveSession(s)}
             style={{ 
               minWidth: '200px', background: activeSession?.id === s.id ? '#1a2e1a' : '#0d160d', 
-              border: `1px solid ${activeSession?.id === s.id ? '#2C5F2D' : 'rgba(44,95,45,0.2)'}`, 
-              borderRadius: '16px', padding: '16px', cursor: 'pointer'
+              border: `1px solid ${activeSession?.id === s.id ? '#2C5F2D' : s.is_active ? 'rgba(44,95,45,0.2)' : 'rgba(239,68,68,0.2)'}`, 
+              borderRadius: '16px', padding: '16px', cursor: 'pointer', flexShrink: 0
             }}
           >
-            <p style={{ color: '#fff', fontSize: '14px', fontWeight: 700, margin: '0 0 4px' }}>{s.service_type}</p>
-            <p style={{ color: '#555', fontSize: '11px', margin: '0 0 12px' }}>Code: <strong style={{ color: '#d4af37' }}>{s.pin}</strong></p>
-            <div style={{ background: '#070d07', borderRadius: '8px', padding: '8px', display: 'flex', justifyContent: 'center' }}>
-              <QRCodeSVG value={s.qr_code_value} size={80} bgColor="#070d07" fgColor="#fff" />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '4px' }}>
+              <p style={{ color: '#fff', fontSize: '14px', fontWeight: 700, margin: 0 }}>{s.service_type}</p>
+              <span style={{ fontSize: '10px', fontWeight: 800, padding: '2px 7px', borderRadius: '100px', background: s.is_active ? 'rgba(44,95,45,0.2)' : 'rgba(239,68,68,0.15)', color: s.is_active ? '#2C5F2D' : '#ef4444' }}>
+                {s.is_active ? 'LIVE' : 'CLOSED'}
+              </span>
             </div>
+            <p style={{ color: '#555', fontSize: '11px', margin: '0 0 12px' }}>Code: <strong style={{ color: '#d4af37' }}>{s.pin}</strong></p>
+            <div onClick={() => setActiveSession(s)} style={{ background: '#070d07', borderRadius: '8px', padding: '8px', display: 'flex', justifyContent: 'center', cursor: 'pointer' }}>
+              <QRCodeSVG value={`${window.location.origin}/check-in/${s.id}`} size={80} bgColor="#070d07" fgColor="#fff" />
+            </div>
+            {s.is_active && (
+              <button
+                onClick={(e) => { e.stopPropagation(); deactivateSession(s.id) }}
+                style={{ marginTop: '10px', width: '100%', padding: '6px', borderRadius: '8px', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444', fontSize: '10px', fontWeight: 800, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.05em' }}
+              >
+                Deactivate
+              </button>
+            )}
           </div>
         ))}
       </div>

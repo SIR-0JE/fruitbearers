@@ -6,7 +6,7 @@ import { useAuth } from '../contexts/AuthContext'
 import LoadingSpinner from '../components/LoadingSpinner'
 
 export default function CheckInPage() {
-  const { sessionId } = useParams()
+  const { id: sessionId } = useParams()  // route is /check-in/:id
   const { user, profile } = useAuth()
   const navigate = useNavigate()
 
@@ -35,16 +35,8 @@ export default function CheckInPage() {
       setStatus('invalid')
       return
     }
+    // Check session is active (admin-controlled, timezone-safe)
     if (!sess.is_active) {
-      setStatus('invalid')
-      setSession(sess)
-      return
-    }
-
-    // ── Check Expiration ──
-    const now = new Date()
-    const expiry = new Date(sess.expires_at)
-    if (now > expiry) {
       setStatus('invalid')
       setSession(sess)
       return
@@ -98,7 +90,7 @@ export default function CheckInPage() {
   if (status === 'loading') return <LoadingSpinner />
 
   const dateLabel = session
-    ? new Date(session.date + 'T12:00:00').toLocaleDateString('en-NG', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+    ? new Date(session.service_date + 'T12:00:00').toLocaleDateString('en-NG', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
     : ''
 
   return (

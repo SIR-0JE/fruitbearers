@@ -102,9 +102,10 @@ export default function ScannerPage() {
       return
     }
 
-    if (new Date(session.expires_at) < new Date()) {
+    // Check session is still active (timezone-safe, admin-controlled)
+    if (!session.is_active) {
       setPhase('success')
-      setCheckInResult({ success: false, message: 'This session has expired' })
+      setCheckInResult({ success: false, message: 'This session is no longer active. Ask your coordinator for a new PIN.' })
       setLoading(false)
       return
     }
