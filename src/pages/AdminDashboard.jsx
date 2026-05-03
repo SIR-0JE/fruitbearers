@@ -699,23 +699,16 @@ function AttendanceTab() {
     const pin = Math.floor(1000 + Math.random() * 9000).toString()
     const qrValue = crypto.randomUUID()
     
-    // Build expires_at: combine the service date with the end_time.
-    // We use UTC midnight of the NEXT day as a safe fallback so the session
-    // lasts all day regardless of the admin's local timezone.
+    // Build expires_at using the admin's LOCAL date+time so timezone math is
+    // always correct regardless of where the admin is running the browser.
+    // new Date("YYYY-MM-DDTHH:MM:SS") without a 'Z' suffix is interpreted as
+    // LOCAL time by the JS engine — exactly what we want.
     const endTime = newSession.end_time || '23:59'
-    // Parse as UTC by appending 'Z' only after converting the local HH:MM to
-    // a proper UTC offset. Simplest correct approach: interpret date+time as
-    // local, let JS convert to UTC via toISOString().
-    const [hours, minutes] = endTime.split(':').map(Number)
-    const expiryDate = new Date(date) // midnight UTC of service date
-    expiryDate.setUTCHours(23, 59, 59, 999) // always expire at 23:59 UTC (end of day)
-    // If admin set a specific early end time, honour it but add a 1-hour buffer
-    // so timezone differences don't cause immediate expiry.
-    if (endTime !== '23:59') {
-      // Store: service date midnight UTC + end hours + 1 hour grace buffer
-      expiryDate.setUTCHours(hours + 1, minutes, 0, 0)
-    }
-    const expiresAt = expiryDate.toISOString()
+    const expiryDate = new Date(`${date}T${endTime}:00`) // local time → correct UTC
+    // Safety: if somehow the date is invalid, fall back to end-of-day
+    const expiresAt = isNaN(expiryDate.getTime())
+      ? new Date(`${date}T23:59:59`).toISOString()
+      : expiryDate.toISOString()
 
     const { data, error } = await supabase.from('attendance_sessions').insert({
       session_name: newSession.name,
@@ -860,7 +853,9 @@ function AttendanceTab() {
           onChange={e => setDate(e.target.value)}
           style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '12px', padding: '10px 14px', color: '#fff', fontSize: '14px', outline: 'none', fontFamily: 'inherit' }}
         />
-        {!loading && (
+        {/* Only show present/missed counts once at least one check-in exists.
+            Before anyone checks in, the counters are meaningless and confusing. */}
+        {!loading && checkins.length > 0 && (
           <>
             <div style={{ background: '#1a2e1a', border: '1px solid rgba(44,95,45,0.3)', borderRadius: '12px', padding: '10px 18px' }}>
               <span style={{ color: '#2C5F2D', fontWeight: 800 }}>{present.length}</span>
@@ -874,13 +869,74 @@ function AttendanceTab() {
         )}
       </div>
 
+      {/* ── Live session banner: shown when session exists but nobody has checked in yet.
+           This prevents the misleading state where ALL members appear as "Missed"
+           the instant a fresh session is created. ── */}
+      {!loading && sessions.length > 0 && checkins.length === 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '14px',
+          background: 'rgba(44,95,45,0.08)', border: '1px solid rgba(44,95,45,0.25)',
+          borderRadius: '16px', padding: '18px 22px', marginBottom: '20px',
+        }}>
+          {/* Pulsing green dot */}
+          <div style={{ position: 'relative', flexShrink: 0 }}>
+            <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: '#2C5F2D' }} />
+            <div style={{
+              position: 'absolute', inset: '-4px',
+              borderRadius: '50%', border: '2px solid rgba(44,95,45,0.4)',
+              animation: 'ping 1.5s cubic-bezier(0,0,0.2,1) infinite',
+            }} />
+          </div>
+          <div>
+            <p style={{ color: '#2C5F2D', fontSize: '13px', fontWeight: 800, margin: '0 0 2px' }}>Session is Live — Waiting for Check-ins</p>
+            <p style={{ color: '#555', fontSize: '12px', margin: 0 }}>
+              No one has checked in yet. Share the QR code or PIN above so members can record their attendance.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Tables container */}
       {loading ? (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
           <Skeleton count={10} height={40} />
           <Skeleton count={10} height={40} />
         </div>
+      ) : sessions.length === 0 ? (
+        /* No sessions at all for this date */
+        <div style={{ textAlign: 'center', padding: '60px 20px', color: '#333' }}>
+          <p style={{ fontSize: '36px', marginBottom: '12px' }}>📋</p>
+          <p style={{ color: '#555', fontSize: '14px', fontWeight: 600, marginBottom: '6px' }}>No sessions for this date</p>
+          <p style={{ color: '#333', fontSize: '13px' }}>Click "New Session" above to start tracking attendance.</p>
+        </div>
+      ) : checkins.length === 0 ? (
+        /* Sessions exist but nobody has checked in yet — don't show misleading "Missed" list */
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+          {/* Present — empty */}
+          <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '16px', overflow: 'hidden' }}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(44,95,45,0.1)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <CheckCircle size={16} color="#2C5F2D" />
+              <p style={{ color: '#fff', fontSize: '14px', fontWeight: 700, margin: 0 }}>Checked In (0)</p>
+            </div>
+            <div style={{ padding: '20px' }}>
+              <p style={{ color: '#333', fontSize: '13px', margin: 0 }}>Waiting for first check-in…</p>
+            </div>
+          </div>
+          {/* Missed — pending, not confirmed yet */}
+          <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.1)', borderRadius: '16px', overflow: 'hidden' }}>
+            <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(44,95,45,0.1)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <XCircle size={16} color="#555" />
+              <p style={{ color: '#888', fontSize: '14px', fontWeight: 700, margin: 0 }}>Not Yet Checked In ({members.length})</p>
+            </div>
+            <div style={{ padding: '16px 20px' }}>
+              <p style={{ color: '#444', fontSize: '12px', lineHeight: 1.6, margin: 0 }}>
+                ⏳ Session is in progress. This list will show who actually missed once the session ends and check-ins are recorded.
+              </p>
+            </div>
+          </div>
+        </div>
       ) : (
+        /* Normal state: at least one check-in recorded */
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
           {/* Present */}
           <div style={{ background: '#0d160d', border: '1px solid rgba(44,95,45,0.2)', borderRadius: '16px', overflow: 'hidden' }}>

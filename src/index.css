@@ -136,6 +136,10 @@ h1, h2, h3, h4, .font-serif {
 }
 .animate-fade-in { animation: fade-in 0.5s ease-out forwards; }
 
+@keyframes ping {
+  75%, 100% { transform: scale(2.2); opacity: 0; }
+}
+
 /* Utils */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
